@@ -1,0 +1,762 @@
+#!/usr/bin/env bash
+# box - ephemeral LXC sandboxes on Proxmox (boat.dev-style), driven over SSH.
+# Needs only: bash, ssh locally; pct/pvesh/pvesm/perl on the PVE host.
+set -euo pipefail
+
+CONFIG_FILE="${BOX_CONFIG:-$HOME/.config/box/config}"
+STATE_DIR="${BOX_STATE:-$HOME/.box}"
+
+# ---------------------------------------------------------------- config
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+: "${PVE_HOST:=}"
+: "${SSH_KEY:=$HOME/.ssh/id_ed25519}"
+: "${TEMPLATE_VOLID:=local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst}"
+: "${STORAGE:=local-lvm}"
+: "${BRIDGE:=vmbr0}"
+: "${GOLDEN_CTID:=9100}"
+: "${ID_MIN:=9101}"
+: "${ID_MAX:=9199}"
+: "${FULL_CLONE:=0}"
+: "${DEFAULT_CORES:=1}"
+: "${DEFAULT_MEM:=1024}"
+: "${DEFAULT_DISK:=8}"
+: "${DEFAULT_TTL:=1h}"
+: "${MAX_RUNNING:=3}"
+: "${MIN_FREE_MB:=1536}"
+: "${MIN_SWAP_FREE_MB:=1024}"
+: "${MAX_STORAGE_PCT:=85}"
+: "${OWNER:=${USER:-box}}"
+: "${BOX_FORCE:=0}"
+
+die() { echo "box: $*" >&2; exit 1; }
+log() { echo "box: $*" >&2; }
+
+# ---------------------------------------------------------------- remote library
+# Runs on the PVE host as: bash -c "<env + this + dispatch>" box-remote <fn> <args...>
+read -r -d '' REMOTE_LIB <<'REMOTE_EOF' || true
+set -Eeuo pipefail
+die() { echo "box: $*" >&2; exit 1; }
+log() { echo "box: $*" >&2; }
+now() { date +%s; }
+conf_of() { echo "/etc/pve/lxc/$1.conf"; }
+top_conf() { sed '/^\[/,$d' "$(conf_of "$1")"; }
+
+is_box() {
+  [[ ${1:-} =~ ^[0-9]+$ ]] || return 1
+  [ "$1" -ge "$ID_MIN" ] && [ "$1" -le "$ID_MAX" ] && [ -f "$(conf_of "$1")" ] || return 1
+  grep -Eq '^tags: (.*;)?box(;.*)?$' <<<"$(top_conf "$1")"
+}
+guard() {
+  [[ ${1:-} =~ ^[0-9]+$ ]] || die "bad id: ${1:-}"
+  is_box "$1" || die "CT $1 is not box-managed (need id $ID_MIN-$ID_MAX and tag 'box'); refusing"
+}
+list_ids() {
+  local f id
+  for f in /etc/pve/lxc/*.conf; do
+    [ -e "$f" ] || continue
+    id=${f##*/}; id=${id%.conf}
+    if is_box "$id"; then echo "$id"; fi
+  done
+  return 0
+}
+status_of() { pct status "$1" | awk '{print $2}'; }
+expires_of() { top_conf "$1" | sed -n 's/.*expires_\([0-9][0-9]*\).*/\1/p' | sed -n 1p; }
+desc_field() { top_conf "$1" | sed -n "s/.*$2_\([A-Za-z0-9._-]*\).*/\1/p" | sed -n 1p; }
+fmt_rem() {
+  local d=$(( $1 - $(now) ))
+  if [ "$d" -le 0 ]; then echo expired
+  elif [ "$d" -ge 3600 ]; then echo "$((d/3600))h$(( (d%3600)/60 ))m"
+  else echo "$((d/60))m"; fi
+}
+ct_ip() {
+  pct exec "$1" -- ip -4 -o addr show dev eth0 scope global </dev/null 2>/dev/null \
+    | awk '{print $4}' | cut -d/ -f1 | sed -n 1p
+}
+
+# Wait until the CT answers pct exec AND eth0 has a DHCP address; then wait (best effort) for sshd.
+wait_ready() {
+  local id=$1 t=${2:-90} i ip=""
+  for ((i=0; i<t; i++)); do
+    if pct exec "$id" -- true </dev/null >/dev/null 2>&1; then
+      ip=$(ct_ip "$id" || true)
+      [ -n "$ip" ] && break
+    fi
+    sleep 1
+  done
+  [ -n "$ip" ] || die "CT $id did not get an IPv4 address within ${t}s (still running; inspect or 'box kill')"
+  for i in $(seq 1 20); do
+    if timeout 2 bash -c "exec 3<>/dev/tcp/$ip/22" 2>/dev/null; then break; fi
+    sleep 1
+  done
+  echo "$ip"
+}
+
+count_running() {
+  local n=0 id
+  for id in $(list_ids); do [ "$(status_of "$id")" = running ] && n=$((n+1)); done
+  echo "$n"
+}
+guard_resources() {
+  local need=$1 avail swapfree running used
+  if [ "${BOX_FORCE:-0}" = 1 ]; then log "BOX_FORCE=1: resource guards skipped"; return 0; fi
+  avail=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)
+  swapfree=$(awk '/^SwapFree:/{print int($2/1024)}' /proc/meminfo)
+  running=$(count_running)
+  used=$(pvesm status --storage "$STORAGE" | awk 'NR==2{gsub(/%/,"",$NF); print int($NF)}')
+  log "host: MemAvailable=${avail}MB SwapFree=${swapfree}MB running_boxes=$running $STORAGE=${used}%"
+  [ "$running" -lt "$MAX_RUNNING" ] || die "already $running running boxes (MAX_RUNNING=$MAX_RUNNING); stop one first"
+  [ "$avail" -ge $((need + MIN_FREE_MB)) ] || die "host MemAvailable ${avail}MB < need ${need}MB + headroom ${MIN_FREE_MB}MB (override: BOX_FORCE=1)"
+  [ "$swapfree" -ge "$MIN_SWAP_FREE_MB" ] || die "host SwapFree ${swapfree}MB < ${MIN_SWAP_FREE_MB}MB; host is thrashing-prone (override: BOX_FORCE=1)"
+  [ "$used" -lt "$MAX_STORAGE_PCT" ] || die "$STORAGE is ${used}% full (limit ${MAX_STORAGE_PCT}%)"
+}
+
+# Keep ephemeral IDs out of every all-guest backup job. add|remove <id> | prune
+backup_exclude() {
+  local op=$1 id=${2:-} jobs jid list
+  jobs=$(pvesh get /cluster/backup --output-format json 2>/dev/null) || { log "warn: cannot read backup jobs"; return 0; }
+  while IFS=$'\t' read -r jid list; do
+    [ -n "$jid" ] || continue
+    if [ -n "$list" ]; then pvesh set "/cluster/backup/$jid" --exclude "$list" >/dev/null
+    else pvesh set "/cluster/backup/$jid" --delete exclude >/dev/null; fi
+    log "backup job $jid exclude -> ${list:-<none>}"
+  done < <(printf '%s' "$jobs" | perl -MJSON::PP -e '
+    local $/; my $jobs = JSON::PP::decode_json(<STDIN>);
+    my ($op, $id, $min, $max, @have) = @ARGV; my %have = map { $_ => 1 } @have;
+    for my $j (@$jobs) {
+      next unless $j->{all};
+      my @old = grep { length } split(/,/, ($j->{exclude} // ""));
+      my %e = map { $_ => 1 } @old;
+      if ($op eq "add") { $e{$id} = 1 }
+      elsif ($op eq "remove") { delete $e{$id} }
+      elsif ($op eq "prune") { for my $k (keys %e) { delete $e{$k} if $k >= $min && $k <= $max && !$have{$k} } }
+      my $new = join(",", sort { $a <=> $b } keys %e);
+      my $was = join(",", sort { $a <=> $b } @old);
+      print "$j->{id}\t$new\n" if $new ne $was;
+    }' "$op" "$id" "$ID_MIN" "$ID_MAX" $(list_ids))
+}
+
+set_desc() { pct set "$1" --description "box1 owner_$2 expires_$3 name_$4" >/dev/null; }
+
+NEW_ID=""
+r_new_cleanup() {
+  trap - ERR
+  [ -n "${NEW_ID:-}" ] || return 0
+  log "failed; destroying half-built CT $NEW_ID"
+  pct stop "$NEW_ID" >/dev/null 2>&1 || true
+  pct destroy "$NEW_ID" --purge --destroy-unreferenced-disks 1 >/dev/null 2>&1 || true
+  backup_exclude remove "$NEW_ID" || true
+}
+
+r_new() {
+  local name=$1 cores=$2 mem=$3 disk=$4 ttl=$5 owner=$6 gpu=$7 id="" i hn exp cur ip
+  local clone_args=(--full 0)
+  [ -f "$(conf_of "$GOLDEN_CTID")" ] || die "golden CT $GOLDEN_CTID missing; run: box golden build"
+  grep -q '^template: 1' <<<"$(top_conf "$GOLDEN_CTID")" || die "CT $GOLDEN_CTID is not a template"
+  [ "$FULL_CLONE" = 1 ] && clone_args=(--full 1 --storage "$STORAGE")
+  if [ "$gpu" = 1 ]; then [ -e /dev/dri/renderD128 ] || die "/dev/dri/renderD128 missing on host"; fi
+
+  exec 9>/run/lock/box.lock
+  flock -w 120 9 || die "could not take box lock"
+  guard_resources "$mem"
+  for ((i=ID_MIN; i<=ID_MAX; i++)); do
+    if ! compgen -G "/etc/pve/nodes/*/lxc/$i.conf" >/dev/null \
+       && ! compgen -G "/etc/pve/nodes/*/qemu-server/$i.conf" >/dev/null \
+       && pvesh get /cluster/nextid --vmid "$i" >/dev/null 2>&1; then id=$i; break; fi
+  done
+  [ -n "$id" ] || die "no free ID in $ID_MIN-$ID_MAX (run 'box gc')"
+  hn=${name:-box-$id}
+  exp=$(( $(now) + ttl ))
+
+  pct clone "$GOLDEN_CTID" "$id" --hostname "$hn" "${clone_args[@]}" >&2
+  NEW_ID=$id
+  trap r_new_cleanup ERR
+  pct set "$id" --tags box --onboot 0 --swap 0 --cores "$cores" --memory "$mem" \
+    --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp,firewall=0,type=veth" >&2
+  set_desc "$id" "$owner" "$exp" "$hn"
+  cur=$(top_conf "$id" | sed -n 's/^rootfs:.*size=\([0-9]*\)G.*/\1/p')
+  if [ -n "$cur" ] && [ "$disk" -gt "$cur" ]; then pct resize "$id" rootfs "${disk}G" >&2
+  elif [ -n "$cur" ] && [ "$disk" -lt "$cur" ]; then log "note: golden rootfs is ${cur}G; cannot shrink to ${disk}G"; fi
+  if [ "$gpu" = 1 ]; then pct set "$id" --dev0 /dev/dri/renderD128,mode=0666 >&2; fi
+  backup_exclude add "$id"
+  pct start "$id" >&2
+  exec 9>&-
+  trap - ERR
+  NEW_ID=""
+  ip=$(wait_ready "$id")
+  echo "$id $ip"
+}
+
+r_resume() {
+  local id=$1 ttl=$2 mem owner name ip
+  guard "$id"
+  mem=$(top_conf "$id" | sed -n 's/^memory: *//p')
+  owner=$(desc_field "$id" owner); name=$(desc_field "$id" name)
+  if [ "$(status_of "$id")" != running ]; then
+    exec 9>/run/lock/box.lock; flock -w 120 9
+    guard_resources "${mem:-1024}"
+    pct start "$id" >&2
+    exec 9>&-
+  fi
+  set_desc "$id" "${owner:-unknown}" "$(( $(now) + ttl ))" "${name:-box-$id}"
+  ip=$(wait_ready "$id")
+  echo "$id $ip"
+}
+
+r_stop() {
+  guard "$1"
+  if [ "$(status_of "$1")" = running ]; then pct shutdown "$1" --timeout 30 >&2 || pct stop "$1" >&2; fi
+}
+
+r_kill() {
+  guard "$1"
+  if [ "$(status_of "$1")" = running ]; then pct stop "$1" >&2; fi
+  pct destroy "$1" --purge --destroy-unreferenced-disks 1 >&2
+  backup_exclude remove "$1"
+}
+
+r_ip() { guard "$1"; [ "$(status_of "$1")" = running ] || die "CT $1 is not running"; ct_ip "$1"; }
+r_guard() { guard "$1"; }
+
+r_list() {
+  local id st ip exp rem cores mem name
+  printf '%-6s %-18s %-8s %-15s %-9s %-5s %-6s %s\n' ID NAME STATUS IP EXPIRES CORES MEM OWNER
+  for id in $(list_ids); do
+    st=$(status_of "$id"); ip="-"
+    [ "$st" = running ] && ip=$(ct_ip "$id" || true)
+    exp=$(expires_of "$id" || true); rem="-"; [ -n "$exp" ] && rem=$(fmt_rem "$exp")
+    cores=$(top_conf "$id" | sed -n 's/^cores: *//p'); mem=$(top_conf "$id" | sed -n 's/^memory: *//p')
+    name=$(top_conf "$id" | sed -n 's/^hostname: *//p')
+    printf '%-6s %-18s %-8s %-15s %-9s %-5s %-6s %s\n' "$id" "$name" "$st" "${ip:--}" "$rem" "${cores:-?}" "${mem:-?}" "$(desc_field "$id" owner)"
+  done
+  echo "# host: MemAvailable=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)MB SwapFree=$(awk '/^SwapFree:/{print int($2/1024)}' /proc/meminfo)MB" >&2
+}
+
+# mode: list (dry run) | stop | destroy
+r_gc() {
+  local mode=$1 id exp st n=0
+  for id in $(list_ids); do
+    exp=$(expires_of "$id" || true)
+    [ -n "$exp" ] && [ "$exp" -lt "$(now)" ] || continue
+    st=$(status_of "$id"); n=$((n+1))
+    case "$mode" in
+      list) echo "expired: $id ($st)" ;;
+      stop) if [ "$st" = running ]; then echo "stopping expired $id"; r_stop "$id"; fi ;;
+      destroy) echo "destroying expired $id"; r_kill "$id" ;;
+    esac
+  done
+  [ "$mode" = list ] || backup_exclude prune
+  echo "expired boxes: $n"
+}
+
+# GUI screenshot: PNG bytes on stdout
+r_shot() {
+  local id=$1 tmp
+  guard "$id"
+  [ "$(status_of "$id")" = running ] || die "CT $id is not running"
+  pct exec "$id" -- bash -lc 'systemctl start box-xvfb box-openbox; sleep 1; DISPLAY=:99 scrot -o /tmp/box-shot.png' </dev/null >&2
+  tmp=$(mktemp /tmp/box-shot.XXXXXX)
+  pct pull "$id" /tmp/box-shot.png "$tmp" >&2
+  cat "$tmp"; rm -f "$tmp"
+}
+
+# read-only environment report for 'box init'
+r_check() {
+  echo "pve: $(pveversion 2>/dev/null | head -1)"
+  echo "mem: $(free -m | awk '/^Mem:/{print "avail=" $7 "MB total=" $2 "MB"}') $(free -m | awk '/^Swap:/{print "swap_used=" $3 "/" $2 "MB"}')"
+  echo "storage:"; pvesm status --storage "$STORAGE" | sed 's/^/  /' || echo "  !! storage $STORAGE not found"
+  if pvesm path "$TEMPLATE_VOLID" >/dev/null 2>&1; then echo "template: ok ($TEMPLATE_VOLID)"; else echo "template: MISSING ($TEMPLATE_VOLID)"; fi
+  if ip link show "$BRIDGE" >/dev/null 2>&1; then echo "bridge: ok ($BRIDGE)"; else echo "bridge: MISSING ($BRIDGE)"; fi
+  if [ -f "$(conf_of "$GOLDEN_CTID")" ]; then
+    if grep -q '^template: 1' <<<"$(top_conf "$GOLDEN_CTID")"; then echo "golden: ok (CT $GOLDEN_CTID template)"; else echo "golden: CT $GOLDEN_CTID exists but is NOT a template"; fi
+  else echo "golden: absent -> run 'box golden build'"; fi
+  local f id foreign=""
+  for f in /etc/pve/nodes/*/lxc/*.conf /etc/pve/nodes/*/qemu-server/*.conf; do
+    [ -e "$f" ] || continue; id=${f##*/}; id=${id%.conf}
+    if [ "$id" -ge "$ID_MIN" ] && [ "$id" -le "$ID_MAX" ] && ! is_box "$id"; then foreign="$foreign $id"; fi
+  done
+  [ -z "$foreign" ] && echo "id range $ID_MIN-$ID_MAX: clear" || echo "id range $ID_MIN-$ID_MAX: IN USE by non-box guests:$foreign (pick another range)"
+  echo "all-guest backup jobs (box IDs get appended to 'exclude'):"
+  pvesh get /cluster/backup --output-format json | perl -MJSON::PP -e '
+    local $/; my $j = JSON::PP::decode_json(<STDIN>);
+    for my $x (@$j) { next unless $x->{all}; printf("  %s enabled=%s exclude=%s\n", $x->{id}, ($x->{enabled} // 1), ($x->{exclude} // "")); }'
+}
+
+r_guard_golden() {
+  [ -f "$(conf_of "$GOLDEN_CTID")" ] || return 1
+  grep -q '^template: 1' <<<"$(top_conf "$GOLDEN_CTID")"
+}
+
+# Download the LXC template via pveam when 'box init' finds it missing.
+r_ensure_template() {
+  local tpl=$1 stor file
+  pvesm path "$tpl" >/dev/null 2>&1 && { echo "template present: $tpl"; return 0; }
+  stor=${tpl%%:*}; file=${tpl##*/}
+  { [ "$stor" != "$tpl" ] && [ "$file" != "$tpl" ]; } || die "cannot parse template volid '$tpl' (want STOR:vztmpl/FILE)"
+  log "downloading $file into $stor (pveam update + download; slow, one time)..."
+  pveam update >&2
+  pveam download "$stor" "$file" >&2
+  pvesm path "$tpl" >/dev/null || die "download finished but $tpl still missing"
+  echo "template ready: $tpl"
+}
+
+r_golden_build() {
+  local pub=$1 tpl=$2 keyf prov
+  [ ! -e "$(conf_of "$GOLDEN_CTID")" ] || die "CT $GOLDEN_CTID already exists; refusing to overwrite (use another GOLDEN_CTID)"
+  pvesm path "$tpl" >/dev/null || die "template $tpl not found"
+  guard_resources 2048
+  keyf=$(mktemp); printf '%s\n' "$pub" >"$keyf"
+  pct create "$GOLDEN_CTID" "$tpl" --hostname box-golden --ostype debian --unprivileged 1 \
+    --features nesting=1,keyctl=1 --cores 2 --memory 2048 --swap 0 --rootfs "$STORAGE:8" \
+    --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp,firewall=0,type=veth" \
+    --ssh-public-keys "$keyf" --onboot 0 --tags boxgolden --description "box1 golden" >&2
+  rm -f "$keyf"
+  backup_exclude add "$GOLDEN_CTID"
+  pct start "$GOLDEN_CTID" >&2
+  wait_ready "$GOLDEN_CTID" 120 >/dev/null
+  prov=$(mktemp /tmp/box-provision.XXXXXX)
+  cat >"$prov" <<'PROV'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl git openssh-server sudo procps iproute2 \
+  iputils-ping unzip jq ripgrep build-essential pkg-config python3 python3-pip python3-venv nodejs npm golang-go
+apt-get install -y --no-install-recommends xvfb openbox xdotool scrot x11-utils x11-xserver-utils \
+  libgtk-3-0t64 libnss3 libgbm1 libasound2t64 || echo "WARN: some GUI runtime libs failed"
+apt-get install -y --no-install-recommends docker.io || echo "WARN: docker.io failed"
+apt-get install -y --no-install-recommends docker-compose || echo "WARN: docker-compose unavailable"
+apt-get install -y --no-install-recommends mesa-va-drivers vainfo || echo "WARN: VAAPI userspace failed"
+cat >/etc/systemd/system/box-xvfb.service <<'UNIT'
+[Unit]
+Description=box Xvfb :99
+[Service]
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1280x800x24 -nolisten tcp
+Restart=on-failure
+UNIT
+cat >/etc/systemd/system/box-openbox.service <<'UNIT'
+[Unit]
+Description=box Openbox on :99
+Requires=box-xvfb.service
+After=box-xvfb.service
+[Service]
+Environment=DISPLAY=:99
+ExecStart=/usr/bin/openbox
+Restart=on-failure
+UNIT
+cat >/etc/systemd/system/box-firstboot.service <<'UNIT'
+[Unit]
+Description=Regenerate SSH host keys on first boot
+Before=ssh.service ssh.socket
+ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+[Install]
+WantedBy=multi-user.target
+UNIT
+echo 'export DISPLAY=:99' >/etc/profile.d/box.sh
+systemctl daemon-reload
+systemctl enable box-firstboot.service ssh.service
+# Xvfb/Openbox/docker.service stay off by default to save RAM; box shot / docker.socket start them on demand.
+systemctl disable docker.service 2>/dev/null || true
+if command -v docker >/dev/null; then
+  systemctl start docker
+  if docker run --rm hello-world >/dev/null 2>&1; then echo "DOCKER_OK: $(docker info --format '{{.Driver}}')"
+  else echo "WARN: docker run hello-world FAILED in unprivileged LXC (see SKILL.md 'Docker-in-LXC')"; fi
+  systemctl stop docker docker.socket || true
+fi
+apt-get clean
+rm -rf /var/lib/apt/lists/* /tmp/* /root/.cache
+rm -f /etc/ssh/ssh_host_*
+: >/etc/machine-id
+PROV
+  pct push "$GOLDEN_CTID" "$prov" /root/provision.sh >&2
+  pct exec "$GOLDEN_CTID" -- bash /root/provision.sh </dev/null >&2 || die "provisioning failed; CT $GOLDEN_CTID left running for inspection"
+  pct exec "$GOLDEN_CTID" -- rm -f /root/provision.sh </dev/null
+  rm -f "$prov"
+  pct shutdown "$GOLDEN_CTID" --timeout 60 >&2
+  pct template "$GOLDEN_CTID" >&2
+  echo "golden CT $GOLDEN_CTID built and converted to template"
+}
+
+fn=$1; shift
+"r_$fn" "$@"
+REMOTE_EOF
+
+# ---------------------------------------------------------------- plumbing
+mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+SSH_PVE=(-o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto -o "ControlPath=$STATE_DIR/cm-%C" -o ControlPersist=60)
+
+need_host() { [ -n "$PVE_HOST" ] || die "not configured; run: box init --host root@<pve-ip>"; }
+
+remote_env() {
+  local v
+  for v in GOLDEN_CTID ID_MIN ID_MAX STORAGE BRIDGE TEMPLATE_VOLID FULL_CLONE MAX_RUNNING MIN_FREE_MB MIN_SWAP_FREE_MB MAX_STORAGE_PCT BOX_FORCE; do
+    printf '%s=%q\n' "$v" "${!v}"
+  done
+}
+
+# rcall <fn> [args...]: run r_<fn> on the PVE host. stdout = result, stderr = progress.
+rcall() {
+  need_host
+  local script
+  script="$(remote_env)"$'\n'"$REMOTE_LIB"
+  ssh -n "${SSH_PVE[@]}" "$PVE_HOST" "bash -c $(printf '%q' "$script") box-remote $(printf '%q ' "$@")"
+}
+
+# pve <cmd...>: run a command on the PVE host with arguments preserved.
+pve() { need_host; ssh "${SSH_PVE[@]}" "$PVE_HOST" "$(printf '%q ' "$@")"; }
+
+ttl_seconds() {
+  [[ $1 =~ ^([0-9]+)([smhd]?)$ ]] || die "bad ttl '$1' (use e.g. 90s 30m 2h 1d)"
+  local n=${BASH_REMATCH[1]} u=${BASH_REMATCH[2]:-s}
+  case "$u" in s) echo "$n";; m) echo $((n*60));; h) echo $((n*3600));; d) echo $((n*86400));; esac
+}
+
+resolve_id() {
+  local a=${1:-current}
+  if [ "$a" = current ]; then
+    [ -s "$STATE_DIR/current" ] || die "no current box; run 'box new' or pass an id"
+    a=$(cat "$STATE_DIR/current")
+  fi
+  [[ $a =~ ^[0-9]+$ ]] || die "bad id '$a'"
+  echo "$a"
+}
+
+known_hosts() { echo "$STATE_DIR/known_hosts_$1"; }
+
+# ---------------------------------------------------------------- TUI (pure bash, zero deps)
+# Colors auto-disable when stdout is not a tty.
+if [ -t 1 ]; then
+  C_RST=$'\e[0m'; C_B=$'\e[1m'; C_DIM=$'\e[2m'
+  C_OK=$'\e[32m'; C_WARN=$'\e[33m'; C_ERR=$'\e[31m'; C_ACC=$'\e[36m'
+else
+  C_RST=; C_B=; C_DIM=; C_OK=; C_WARN=; C_ERR=; C_ACC=
+fi
+
+tui_banner() {
+  printf '\n%s%s  box%s  %sProxmox LXCs on demand for your agents%s\n' "$C_B" "$C_ACC" "$C_RST" "$C_DIM" "$C_RST"
+}
+tui_step() { printf '\n%s[%s]%s %s%s%s\n' "$C_ACC" "$1" "$C_RST" "$C_B" "$2" "$C_RST"; }
+tui_ok()   { printf '  %sok%s   %s\n' "$C_OK" "$C_RST" "$*"; }
+tui_warn() { printf '  %swarn%s %s\n' "$C_WARN" "$C_RST" "$*"; }
+tui_info() { printf '  %s\n' "$*"; }
+# tui_ask <varname> <prompt> [default] : reads from /dev/tty so curl-piped runs work.
+tui_ask() {
+  local _var=$1 _prompt=$2 _def=${3:-} _ans
+  if [ -n "$_def" ]; then
+    printf '  %s [%s%s%s]: ' "$_prompt" "$C_DIM" "$_def" "$C_RST"
+  else
+    printf '  %s: ' "$_prompt"
+  fi
+  IFS= read -r _ans </dev/tty 2>/dev/null || _ans=""
+  [ -n "$_ans" ] || _ans="$_def"
+  printf -v "$_var" '%s' "$_ans"
+}
+# tui_yesno <prompt> [default Y|N] -> returns 0 for yes.
+tui_yesno() {
+  local _prompt=$1 _def=${2:-Y} _hint _ans
+  if [ "$_def" = Y ]; then _hint="Y/n"; else _hint="y/N"; fi
+  printf '  %s [%s]: ' "$_prompt" "$_hint"
+  IFS= read -r _ans </dev/tty 2>/dev/null || _ans=""
+  [ -n "$_ans" ] || _ans="$_def"
+  [[ $_ans =~ ^[Yy] ]]
+}
+# with_spin <message> <cmd...> : runs cmd, shows spinner, replays stderr on failure.
+# stdout passes through (so callers can capture it); only stderr is captured.
+with_spin() {
+  local msg=$1 out rc pid i=0 f
+  shift
+  out=$(mktemp)
+  "$@" 2>"$out" & pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    case $((i % 4)) in 0) f='|';; 1) f='/';; 2) f='-';; 3) f='\';; esac
+    printf '\r  %s %s' "$msg" "$f" >&2
+    i=$((i+1))
+    sleep 0.15
+  done
+  wait "$pid"; rc=$?
+  printf '\r%*s\r' 40 "" >&2
+  if [ "$rc" -ne 0 ]; then sed 's/^/  /' "$out" >&2; fi
+  rm -f "$out"
+  return "$rc"
+}
+
+# ---------------------------------------------------------------- commands
+cmd_init() {
+  local host="" key="" force=0 storage="" bridge="" golden="" tpl="" tui=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --host) host=$2; shift 2;; --key) key=$2; shift 2;; --storage) storage=$2; shift 2;;
+      --bridge) bridge=$2; shift 2;; --golden) golden=$2; shift 2;; --template) tpl=$2; shift 2;;
+      --force) force=1; shift;; *) die "init: unknown option $1";;
+    esac
+  done
+  # Interactive TUI when run on a terminal with nothing (or only --force) to do.
+  if [ -t 0 ] || [ -c /dev/tty ]; then
+    if [ -z "$host$key$storage$bridge$golden$tpl" ]; then tui=1; fi
+  fi
+  if [ "$tui" = 0 ]; then cmd_init_plain "$host" "$key" "$force" "$storage" "$bridge" "$golden" "$tpl"; return; fi
+
+  tui_banner
+  tui_step "1/4" "Where is your Proxmox?"
+  tui_info "${C_DIM}user@host with SSH already configured (key auth, no password prompt).${C_RST}"
+  tui_ask host "  Proxmox SSH" "${PVE_HOST:-}"
+  [ -n "$host" ] || die "need a host"
+
+  tui_step "2/4" "Which SSH key?"
+  tui_info "${C_DIM}Its public key gets baked into every box for 'box ssh'.${C_RST}"
+  tui_ask key "  Private key" "${SSH_KEY:-$HOME/.ssh/id_ed25519}"
+  if [ ! -f "$key.pub" ]; then
+    if [ ! -f "$key" ] && tui_yesno "  No key at $key. Generate one?" Y; then
+      ssh-keygen -t ed25519 -f "$key" -N "" -C "box" || die "ssh-keygen failed"
+    fi
+    [ -f "$key.pub" ] || die "public key $key.pub not found"
+  fi
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" true 2>/dev/null; then
+    tui_warn "cannot ssh to $host non-interactively."
+    if tui_yesno "  Copy your key over now (ssh-copy-id, asks for password once)?" Y; then
+      ssh-copy-id -i "$key.pub" "$host" </dev/tty || die "ssh-copy-id failed"
+      ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" true || die "still cannot ssh to $host"
+    else
+      die "fix SSH first: ssh-copy-id -i $key.pub $host"
+    fi
+  fi
+  tui_ok "SSH to $host works"
+
+  tui_step "3/4" "Confirm settings ${C_DIM}(Enter = default)${C_RST}"
+  tui_ask storage "  Storage" "$STORAGE"
+  tui_ask bridge "  Bridge" "$BRIDGE"
+  tui_ask tpl "  LXC template volid" "$TEMPLATE_VOLID"
+  tui_ask golden "  Golden CT id" "$GOLDEN_CTID"
+
+  cmd_init_write "$host" "$key" "$storage" "$bridge" "$golden" "$tpl"
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+
+  tui_step "4/4" "Checking Proxmox (read-only)"
+  local report
+  report=$(mktemp)
+  with_spin "probing $PVE_HOST" rcall check >"$report" || { cat "$report"; rm -f "$report"; die "checks failed"; }
+  sed 's/^/  /' "$report"
+  if grep -q '^template: MISSING' "$report"; then
+    if tui_yesno "  Template missing. Download it now (a few minutes)?" Y; then
+      with_spin "downloading template" rcall ensure_template "$TEMPLATE_VOLID" \
+        || die "template download failed"
+      tui_ok "template ready"
+    else
+      tui_warn "skipped — 'box new' will fail until the template exists"
+    fi
+  fi
+  rm -f "$report"
+  if ! rcall guard_golden >/dev/null 2>&1; then
+    if tui_yesno "  No golden image. Build it now (apt run, ~5-10 min)?" Y; then
+      cmd_golden build
+    else
+      tui_warn "skipped — run 'box golden build' later"
+    fi
+  else
+    tui_ok "golden image present"
+  fi
+  printf '\n  %sAll set.%s Try: %sbox new --name demo%s then %sbox exec current -- uname -a%s\n' \
+    "$C_OK" "$C_RST" "$C_B" "$C_RST" "$C_B" "$C_RST"
+}
+
+# Non-interactive init (flags or piped). Same as the original behaviour.
+cmd_init_plain() {
+  local host=$1 key=$2 force=$3 storage=$4 bridge=$5 golden=$6 tpl=$7
+  if [ -f "$CONFIG_FILE" ] && [ "$force" = 0 ]; then
+    log "config exists ($CONFIG_FILE); re-running read-only checks. Use --force to rewrite."
+  else
+    cmd_init_write "${host:-${PVE_HOST:-}}" "$key" "$storage" "$bridge" "$golden" "$tpl"
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+  fi
+  [ -f "$SSH_KEY.pub" ] || die "public key $SSH_KEY.pub not found (set SSH_KEY in $CONFIG_FILE)"
+  log "checking $PVE_HOST (read-only)..."
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$PVE_HOST" true || die "cannot ssh to $PVE_HOST non-interactively (ssh-copy-id first)"
+  rcall check
+  log "next: box golden build   (creates CT $GOLDEN_CTID; only if 'golden: absent')"
+}
+
+cmd_init_write() {
+  local host=$1 key=$2 storage=$3 bridge=$4 golden=$5 tpl=$6
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  cat >"$CONFIG_FILE" <<CFG
+# box config (sourced as shell). Written by 'box init'.
+PVE_HOST=${host:-${PVE_HOST:-}}
+SSH_KEY=${key:-$SSH_KEY}
+TEMPLATE_VOLID=${tpl:-$TEMPLATE_VOLID}
+STORAGE=${storage:-$STORAGE}
+BRIDGE=${bridge:-$BRIDGE}
+GOLDEN_CTID=${golden:-$GOLDEN_CTID}
+ID_MIN=$ID_MIN
+ID_MAX=$ID_MAX
+FULL_CLONE=$FULL_CLONE
+DEFAULT_CORES=$DEFAULT_CORES
+DEFAULT_MEM=$DEFAULT_MEM
+DEFAULT_DISK=$DEFAULT_DISK
+DEFAULT_TTL=$DEFAULT_TTL
+MAX_RUNNING=$MAX_RUNNING
+MIN_FREE_MB=$MIN_FREE_MB
+MIN_SWAP_FREE_MB=$MIN_SWAP_FREE_MB
+MAX_STORAGE_PCT=$MAX_STORAGE_PCT
+OWNER=$OWNER
+CFG
+  chmod 600 "$CONFIG_FILE"
+  log "wrote $CONFIG_FILE"
+}
+
+cmd_golden() {
+  [ "${1:-}" = build ] || die "usage: box golden build"
+  [ -f "$SSH_KEY.pub" ] || die "public key $SSH_KEY.pub not found"
+  rcall golden_build "$(cat "$SSH_KEY.pub")" "$TEMPLATE_VOLID"
+}
+
+cmd_new() {
+  local cores=$DEFAULT_CORES mem=$DEFAULT_MEM disk=$DEFAULT_DISK ttl=$DEFAULT_TTL name="" gpu=0 owner=$OWNER out id ip
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cores) cores=$2; shift 2;; --mem) mem=$2; shift 2;; --disk) disk=${2%G}; shift 2;;
+      --ttl) ttl=$2; shift 2;; --name) name=$2; shift 2;; --gpu) gpu=1; shift;; --owner) owner=$2; shift 2;;
+      *) die "new: unknown option $1";;
+    esac
+  done
+  [[ $cores =~ ^[0-9]+$ && $mem =~ ^[0-9]+$ && $disk =~ ^[0-9]+$ ]] || die "cores/mem/disk must be integers (mem in MB, disk in G)"
+  [ -z "$name" ] || [[ $name =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "name must be lowercase [a-z0-9-]"
+  owner=$(printf '%s' "$owner" | tr -c 'A-Za-z0-9._-' '-')
+  out=$(rcall new "$name" "$cores" "$mem" "$disk" "$(ttl_seconds "$ttl")" "$owner" "$gpu")
+  read -r id ip <<<"$out"
+  printf '%s' "$id" >"$STATE_DIR/current"
+  echo "$id $ip"
+}
+
+cmd_exec() {
+  local id cmd
+  id=$(resolve_id "${1:-current}"); shift || true
+  [ "${1:-}" = -- ] && shift
+  [ $# -gt 0 ] || die "usage: box exec <id|current> -- <cmd...>"
+  rcall guard "$id"
+  if [ $# -eq 1 ]; then cmd=$1; else cmd=$(printf '%q ' "$@"); fi
+  pve pct exec "$id" -- bash -lc "$cmd"
+}
+
+cmd_ssh() {
+  local id ip
+  id=$(resolve_id "${1:-current}"); shift || true
+  [ "${1:-}" = -- ] && shift
+  ip=$(rcall ip "$id")
+  exec ssh -J "$PVE_HOST" -i "$SSH_KEY" -o "UserKnownHostsFile=$(known_hosts "$id")" \
+    -o StrictHostKeyChecking=accept-new "root@$ip" "$@"
+}
+
+cmd_list() { rcall list; }
+cmd_stop() { rcall stop "$(resolve_id "${1:-current}")"; }
+
+cmd_resume() {
+  local id ttl=$DEFAULT_TTL out ip
+  id=$(resolve_id "${1:-current}"); shift || true
+  [ "${1:-}" = --ttl ] && ttl=${2:?--ttl needs a value}
+  out=$(rcall resume "$id" "$(ttl_seconds "$ttl")")
+  read -r id ip <<<"$out"
+  printf '%s' "$id" >"$STATE_DIR/current"
+  echo "$id $ip"
+}
+
+cmd_kill() {
+  local id force=0 a
+  id=$(resolve_id "${1:-current}"); shift || true
+  for a in "$@"; do case "$a" in -f|--force|--yes) force=1;; *) die "kill: unknown option $a";; esac; done
+  rcall guard "$id"
+  if [ "$force" = 0 ]; then
+    [ -t 0 ] && [ -c /dev/tty ] || die "kill in scripts needs -f (destroys CT $id and its disk)"
+    printf 'destroy CT %s and its disk? type the id to confirm (or use -f): ' "$id"
+    IFS= read -r a </dev/tty
+    [ "$a" = "$id" ] || die "aborted"
+  fi
+  rcall kill "$id"
+  rm -f "$(known_hosts "$id")"
+  if [ -s "$STATE_DIR/current" ] && [ "$(cat "$STATE_DIR/current")" = "$id" ]; then rm -f "$STATE_DIR/current"; fi
+  log "destroyed $id"
+}
+
+cmd_shot() {
+  local id out tmp
+  id=$(resolve_id "${1:-current}"); shift || true
+  out=${1:-./box-$id-$(date +%Y%m%d-%H%M%S).png}
+  tmp=$(mktemp)
+  rcall shot "$id" >"$tmp" || { rm -f "$tmp"; die "screenshot failed"; }
+  [ "$(head -c4 "$tmp" | tail -c3)" = PNG ] || { rm -f "$tmp"; die "result is not a PNG"; }
+  mv "$tmp" "$out"; echo "$out"
+}
+
+cmd_gc() {
+  local mode=list force=0 a
+  for a in "$@"; do
+    case "$a" in --expired) mode=stop;; --destroy) mode=destroy;; -f|--force|--yes) force=1;; *) die "gc: unknown option $a";; esac
+  done
+  if [ "$mode" = destroy ] && [ "$force" = 0 ]; then
+    if [ -t 0 ] && [ -c /dev/tty ]; then
+      printf 'destroy all expired boxes? type "yes" to confirm (or use -f): '
+      IFS= read -r a </dev/tty
+      [ "$a" = yes ] || die "aborted"
+    else
+      die "gc --destroy in scripts needs -f"
+    fi
+  fi
+  rcall gc "$mode"
+}
+
+usage() {
+  cat <<'USAGE'
+box - Proxmox LXCs on demand for your agents (ephemeral Debian containers, use-and-destroy)
+
+COMMANDS
+  box init [flags]              one-time setup. On a TTY with no flags: guided TUI
+                                (host, SSH key, checks, template download, golden build).
+                                Flags: --host user@ip --key PATH --storage S --bridge B
+                                --golden ID --template VOLID --force
+  box golden build              build golden template CT (required once, after init)
+  box new [opts]                create + start a box -> prints "<id> <ip>"
+                                --cores N --mem MB --disk G --ttl 1h --name slug --gpu --owner X
+  box exec <id|current> -- <cmd...>   run command, print output (one arg = shell string)
+  box ssh  <id|current> [-- cmd]      interactive shell (or remote command) into the box
+  box list                      table of boxes: id, name, status, ip, ttl left, cores, mem, owner
+  box stop <id|current>         stop (disk kept, TTL kept)
+  box resume <id|current> [--ttl 1h]  start again + extend TTL -> prints "<id> <ip>"
+  box kill <id|current> [-f]    DESTROY box and disk. Confirms on a TTY; -f required in scripts
+  box shot <id|current> [out.png]     Xvfb :99 screenshot (starts display if needed)
+  box gc [--expired]            stop expired boxes
+  box gc --destroy [-f]         DESTROY expired boxes. Confirms on a TTY; -f required in scripts
+  box help | -h                 this
+
+SEMANTICS
+  <id>              numeric CT id (e.g. 9101). "current" = last box you created/resumed.
+  TTL               boxes expire after TTL (default 1h). Expired = stoppable/destroyable by
+                    gc; not auto-destroyed. resume --ttl extends. Stored as expires_<epoch>.
+  safety            every command only touches ids 9101-9199 with PVE tag "box".
+                    Anything else is refused. Truly destructive: kill, gc --destroy.
+  guards            new/resume refuse when host RAM/swap is low, >3 boxes running, or
+                    storage >=85%. Override only with explicit human OK: BOX_FORCE=1.
+  backups           box ids are auto-excluded from all-guest backup jobs.
+  output            new/resume print "<id> <ip>"; exec/ssh stream command output.
+  scripts/agents    no prompts except init TUI; pass -f to kill/gc --destroy.
+                    Safe pattern: box new -> box exec current -- ... -> box kill current -f
+
+CONFIG & STATE
+  ~/.config/box/config   shell-sourced config (written by init): PVE_HOST SSH_KEY STORAGE
+                         BRIDGE TEMPLATE_VOLID GOLDEN_CTID ID_MIN ID_MAX defaults, guards, OWNER
+  ~/.box/                local state: "current" file, per-box known_hosts, ssh control socket
+  env overrides          BOX_CONFIG BOX_STATE BOX_FORCE=1
+USAGE
+}
+
+main() {
+  local c=${1:-help}; shift || true
+  case "$c" in
+    init) cmd_init "$@";; golden) cmd_golden "$@";; new) cmd_new "$@";; exec) cmd_exec "$@";;
+    ssh) cmd_ssh "$@";; list|ls) cmd_list;; stop) cmd_stop "$@";; resume) cmd_resume "$@";;
+    kill|rm) cmd_kill "$@";; shot) cmd_shot "$@";; gc) cmd_gc "$@";;
+    help|-h|--help) usage;; *) usage >&2; exit 2;;
+  esac
+}
+main "$@"
