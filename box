@@ -322,7 +322,7 @@ apt-get install -y --no-install-recommends ca-certificates curl git openssh-serv
   iputils-ping unzip jq ripgrep build-essential pkg-config python3 python3-pip python3-venv nodejs npm golang-go
 apt-get install -y --no-install-recommends xvfb openbox xdotool scrot x11-utils x11-xserver-utils \
   libgtk-3-0t64 libnss3 libgbm1 libasound2t64 || echo "WARN: some GUI runtime libs failed"
-apt-get install -y --no-install-recommends docker.io || echo "WARN: docker.io failed"
+apt-get install -y --no-install-recommends docker.io docker-cli || echo "WARN: docker.io failed"
 apt-get install -y --no-install-recommends docker-compose || echo "WARN: docker-compose unavailable"
 apt-get install -y --no-install-recommends mesa-va-drivers vainfo || echo "WARN: VAAPI userspace failed"
 cat >/etc/systemd/system/box-xvfb.service <<'UNIT'
