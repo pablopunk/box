@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# box - ephemeral LXC sandboxes on Proxmox (boat.dev-style), driven over SSH.
+# box - ephemeral LXC sandboxes on Proxmox, driven over SSH.
 # Needs only: bash, ssh locally; pct/pvesh/pvesm/perl on the PVE host.
 set -euo pipefail
 
