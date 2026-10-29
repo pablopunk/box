@@ -7,9 +7,16 @@ CONFIG_FILE="${BOX_CONFIG:-$HOME/.config/box/config}"
 STATE_DIR="${BOX_STATE:-$HOME/.box}"
 
 # ---------------------------------------------------------------- config
+default_key() {
+  local k
+  for k in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_ecdsa" "$HOME/.ssh/id_rsa"; do
+    [ -f "$k" ] && { printf '%s' "$k"; return 0; }
+  done
+  printf '%s' "$HOME/.ssh/id_ed25519"
+}
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 : "${PVE_HOST:=}"
-: "${SSH_KEY:=$HOME/.ssh/id_ed25519}"
+: "${SSH_KEY:=$(default_key)}"
 : "${TEMPLATE_VOLID:=local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst}"
 : "${STORAGE:=local-lvm}"
 : "${BRIDGE:=vmbr0}"
@@ -300,8 +307,15 @@ r_ensure_template() {
 }
 
 r_golden_build() {
-  local pub=$1 tpl=$2 keyf prov
-  [ ! -e "$(conf_of "$GOLDEN_CTID")" ] || die "CT $GOLDEN_CTID already exists; refusing to overwrite (use another GOLDEN_CTID)"
+  local pub=$1 tpl=$2 force=${3:-0} keyf prov
+  if [ -e "$(conf_of "$GOLDEN_CTID")" ]; then
+    [ "$force" = 1 ] || die "CT $GOLDEN_CTID already exists; rebuild with 'box golden build --force' (or another GOLDEN_CTID)"
+    grep -q '^tags: .*boxgolden' <<<"$(top_conf "$GOLDEN_CTID")" || die "CT $GOLDEN_CTID is not a box golden (missing 'boxgolden' tag); refusing to destroy"
+    log "rebuilding golden: destroying CT $GOLDEN_CTID (PVE refuses if boxes still reference it)"
+    pct stop "$GOLDEN_CTID" >/dev/null 2>&1 || true
+    pct destroy "$GOLDEN_CTID" --purge --destroy-unreferenced-disks 1 >&2
+    backup_exclude remove "$GOLDEN_CTID" || true
+  fi
   pvesm path "$tpl" >/dev/null || die "template $tpl not found"
   guard_resources 2048
   keyf=$(mktemp); printf '%s\n' "$pub" >"$keyf"
@@ -320,9 +334,16 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl git openssh-server sudo procps iproute2 \
   iputils-ping unzip jq ripgrep build-essential pkg-config python3 python3-pip python3-venv nodejs npm golang-go
-apt-get install -y --no-install-recommends xvfb openbox xdotool scrot x11-utils x11-xserver-utils \
-  libgtk-3-0t64 libnss3 libgbm1 libasound2t64 || echo "WARN: some GUI runtime libs failed"
-apt-get install -y --no-install-recommends docker.io docker-cli || echo "WARN: docker.io failed"
+apt-get install -y --no-install-recommends xvfb openbox xdotool scrot x11-utils x11-xserver-utils libnss3 libgbm1 \
+  || echo "WARN: GUI base failed"
+# GTK/ALSA package names differ across Debian releases (t64 suffix since trixie).
+apt-get install -y --no-install-recommends libgtk-3-0t64 libasound2t64 \
+  || apt-get install -y --no-install-recommends libgtk-3-0 libasound2 \
+  || echo "WARN: some GUI runtime libs failed"
+# docker-cli is a separate package since Debian 13; older releases ship the client in docker.io.
+apt-get install -y --no-install-recommends docker.io docker-cli \
+  || apt-get install -y --no-install-recommends docker.io \
+  || echo "WARN: docker failed"
 apt-get install -y --no-install-recommends docker-compose || echo "WARN: docker-compose unavailable"
 apt-get install -y --no-install-recommends mesa-va-drivers vainfo || echo "WARN: VAAPI userspace failed"
 cat >/etc/systemd/system/box-xvfb.service <<'UNIT'
@@ -608,9 +629,12 @@ CFG
 }
 
 cmd_golden() {
-  [ "${1:-}" = build ] || die "usage: box golden build"
+  local arg=${1:-} force=0
+  [ "$arg" = build ] || die "usage: box golden build [--force]"
+  shift || true
+  [ "${1:-}" = "--force" ] && force=1
   [ -f "$SSH_KEY.pub" ] || die "public key $SSH_KEY.pub not found"
-  rcall golden_build "$(cat "$SSH_KEY.pub")" "$TEMPLATE_VOLID"
+  rcall golden_build "$(cat "$SSH_KEY.pub")" "$TEMPLATE_VOLID" "$force"
 }
 
 cmd_new() {
@@ -716,7 +740,7 @@ COMMANDS
                                 (host, SSH key, checks, template download, golden build).
                                 Flags: --host user@ip --key PATH --storage S --bridge B
                                 --golden ID --template VOLID --force
-  box golden build              build golden template CT (required once, after init)
+  box golden build [--force]        build golden template CT (required once; --force rebuilds in place)
   box new [opts]                create + start a box -> prints "<id> <ip>"
                                 --cores N --mem MB --disk G --ttl 1h --name slug --gpu --owner X
   box exec <id|current> -- <cmd...>   run command, print output (one arg = shell string)
