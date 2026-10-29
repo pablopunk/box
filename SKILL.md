@@ -1,6 +1,6 @@
 ---
 name: box
-description: Proxmox LXCs on demand for your agents. Spin up disposable Debian LXC sandboxes on any Proxmox host with the `box` CLI — boat.dev-style new/exec/ssh/stop/resume/kill, TTL, Docker, dev toolchains and an Xvfb GUI screenshot path. Use when the user wants a throwaway Linux box, an isolated place to run untrusted/experimental code, a GUI/browser test display, or says "box", "sandbox", "spin up a box".
+description: Proxmox LXCs on demand for agents. Spin up disposable Debian LXC sandboxes on any Proxmox host with the `box` CLI — new/exec/ssh/stop/resume/kill, TTL, Docker, dev toolchains and an Xvfb GUI screenshot path. Use when the user wants a throwaway Linux box, an isolated place to run untrusted/experimental code, a GUI/browser test display, or says "box", "sandbox", "spin up a box".
 ---
 
 # box
