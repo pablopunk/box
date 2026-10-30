@@ -17,3 +17,5 @@ box stop current; box resume current --ttl 1h
 box kill current --yes
 box gc                                        # dry run; --expired stops, --destroy --yes deletes
 ```
+
+The golden template includes Chromium, `xdg-open`, and an Xvfb display for GUI tasks, plus common networking and archive utilities. Start the display with `box shot`, then run GUI commands with `DISPLAY=:99`. Existing golden templates need `box golden build --force` to pick up package changes; Proxmox may refuse a rebuild while boxes still reference the template.

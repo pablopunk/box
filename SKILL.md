@@ -34,4 +34,4 @@ box kill current -f               # destroy (use-and-destroy)
 - `box` only touches ids in its configured range with PVE tag `box`; anything else is refused.
 - Resource guards refuse new boxes when host RAM/swap is tight or storage is full.
 - Opt-in `--gpu` shares the host GPU via a DRM device bind — verify with a real encode, not just device listing.
-- Golden image ships Docker, node/python/go toolchains and Xvfb/Openbox/xdotool/scrot. Heavy toolchains install per box, not in the golden.
+- Golden image ships Docker, node/python/go toolchains and Xvfb/Openbox/xdotool/scrot, Chromium and xdg-utils. GUI apps need the Xvfb display (start it with `box shot`, then use `DISPLAY=:99`). Heavy toolchains install per box, not in the golden.

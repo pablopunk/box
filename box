@@ -333,8 +333,8 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl git openssh-server sudo procps iproute2 \
-  iputils-ping unzip jq ripgrep build-essential pkg-config python3 python3-pip python3-venv nodejs npm golang-go
-apt-get install -y --no-install-recommends xvfb openbox xdotool scrot x11-utils x11-xserver-utils libnss3 libgbm1 \
+  iputils-ping dnsutils netcat-openbsd file less zip unzip jq ripgrep build-essential pkg-config python3 python3-pip python3-venv nodejs npm golang-go
+apt-get install -y --no-install-recommends xvfb openbox xdotool scrot x11-utils x11-xserver-utils libnss3 libgbm1 xdg-utils chromium dbus-x11 \
   || echo "WARN: GUI base failed"
 # GTK/ALSA package names differ across Debian releases (t64 suffix since trixie).
 apt-get install -y --no-install-recommends libgtk-3-0t64 libasound2t64 \
