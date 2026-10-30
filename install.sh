@@ -3,7 +3,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/pablopunk/box/main/install.sh | sh
 #
 # Clones this repo to ~/.local/share/box, links `box` into ~/.local/bin,
-# links the skill into ~/.agents/skills and ~/.claude/skills (symlink-aware:
+# installs the skill into ~/.agents/skills and ~/.claude/skills (symlink-aware:
 # dirs resolving to the same place get one install, never two),
 # then runs the guided `box init` TUI.
 set -eu
@@ -47,34 +47,29 @@ canon() {
   fi
 }
 HANDLED=""
-link_skill() {
+install_skill() {
   dir=$1
   mkdir -p "$dir"
   c=$(canon "$dir")
   case " $HANDLED " in
-    *" $c "*) log "skipping $dir (same place as an already-linked skills dir)"; return 0;;
+    *" $c "*) log "skipping $dir (same place as an already-installed skills dir)"; return 0;;
   esac
   HANDLED="$HANDLED $c"
   dest="$dir/box"
   if [ -L "$dest" ]; then
-    if [ "$(canon "$dest")" = "$(canon "$SHARE")" ]; then
-      log "skill already linked: $dest"
-    else
-      ln -sfn "$SHARE" "$dest"
-      log "relinked skill: $dest -> $SHARE"
-    fi
-  elif [ -e "$dest" ]; then
+    rm "$dest"
+  elif [ -e "$dest" ] && [ ! -f "$dest/.box-installed" ]; then
     bak="$dest.bak-$(date +%s)"
     mv "$dest" "$bak"
-    ln -sfn "$SHARE" "$dest"
-    log "backed up existing $dest to $bak; linked skill instead"
-  else
-    ln -s "$SHARE" "$dest"
-    log "linked skill: $dest -> $SHARE"
+    log "backed up existing $dest to $bak"
   fi
+  mkdir -p "$dest"
+  cp "$SHARE/SKILL.md" "$dest/SKILL.md"
+  : > "$dest/.box-installed"
+  log "installed skill: $dest"
 }
-link_skill "$HOME/.agents/skills"
-link_skill "$HOME/.claude/skills"
+install_skill "$HOME/.agents/skills"
+install_skill "$HOME/.claude/skills"
 
 # --- 4. PATH hint ---
 case ":$PATH:" in

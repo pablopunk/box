@@ -4,7 +4,7 @@
 curl -fsSL https://raw.githubusercontent.com/pablopunk/box/main/install.sh | sh
 ```
 
-That's the whole install. It clones this repo to `~/.local/share/box`, links `box` into `~/.local/bin`, links the skill into `~/.agents/skills` and `~/.claude/skills` (once per real location — symlinked skills dirs are detected, never double-installed), then walks you through the guided `box init` TUI: Proxmox host, SSH key, read-only checks, template download, golden build.
+That's the whole install. It clones this repo to `~/.local/share/box`, links `box` into `~/.local/bin`, copies the skill into `~/.agents/skills` and `~/.claude/skills` (once per real location — symlinked skills dirs are detected, never double-installed), so synced skills work across machines. Each machine needs `box` installed and `~/.local/bin` on its PATH. The installer then walks you through the guided `box init` TUI: Proxmox host, SSH key, read-only checks, template download, golden build.
 
 ## Example
 

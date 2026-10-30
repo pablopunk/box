@@ -15,7 +15,7 @@ Proxmox LXCs on demand for your agents. Ephemeral unprivileged Debian containers
 curl -fsSL https://raw.githubusercontent.com/pablopunk/box/main/install.sh | sh
 ```
 
-Installs `box`, links this skill, and runs the guided `box init` TUI (Proxmox host, SSH key, read-only checks, template download, golden build). Prereq: SSH to the PVE host with key auth. Flags (`box init --host …`) skip the TUI for scripts.
+Installs `box` in `~/.local/bin`, copies this skill, and runs the guided `box init` TUI (Proxmox host, SSH key, read-only checks, template download, golden build). Run `box` from PATH; install it on each machine and add `~/.local/bin` to PATH. Prereq: SSH to the PVE host with key auth. Flags (`box init --host …`) skip the TUI for scripts.
 
 ## Everyday flow
 
