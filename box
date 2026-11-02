@@ -331,6 +331,7 @@ r_golden_build() {
   cat >"$prov" <<'PROV'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
+export HOME=/root PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin   # pct exec has no /usr/local/bin
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl git openssh-server sudo procps iproute2 \
   iputils-ping dnsutils netcat-openbsd file less zip unzip jq ripgrep rsync locales build-essential pkg-config \
@@ -348,7 +349,8 @@ curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh || echo "
 cat >/etc/profile.d/mise.sh <<'MISE'
 export PATH="$HOME/.local/share/mise/shims:/usr/local/bin:$PATH"
 MISE
-if command -v mise >/dev/null; then mise use -g node@lts || echo "WARN: node via mise failed"; fi
+if /usr/local/bin/mise use -g --yes node@lts; then test -x "$HOME/.local/share/mise/shims/node" && echo "MISE_OK: node $(/usr/local/bin/mise exec -- node -v)" || echo "WARN: mise node shim missing"
+else echo "WARN: node via mise failed"; fi
 # GTK/ALSA package names differ across Debian releases (t64 suffix since trixie).
 apt-get install -y --no-install-recommends libgtk-3-0t64 libasound2t64 \
   || apt-get install -y --no-install-recommends libgtk-3-0 libasound2 \
@@ -379,13 +381,17 @@ UNIT
 cat >/etc/systemd/system/box-firstboot.service <<'UNIT'
 [Unit]
 Description=Regenerate SSH host keys on first boot
-Before=ssh.service ssh.socket
+# No default dependencies: they order this unit after sockets.target, which ssh.socket precedes,
+# and that ordering cycle made systemd drop this job, leaving sshd without host keys.
+DefaultDependencies=no
+After=local-fs.target
+Before=ssh.service ssh.socket sockets.target
 ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/ssh-keygen -A
 [Install]
-WantedBy=multi-user.target
+WantedBy=sysinit.target
 UNIT
 echo 'export DISPLAY=:99' >/etc/profile.d/box.sh
 systemctl daemon-reload
