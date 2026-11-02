@@ -16,6 +16,7 @@ default_key() {
 }
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 : "${PVE_HOST:=}"
+: "${PVE_HOST_ALT:=}"          # optional second address of the same host (e.g. root@100.x.y.z over Tailscale)
 : "${SSH_KEY:=$(default_key)}"
 : "${TEMPLATE_VOLID:=local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst}"
 : "${STORAGE:=local-lvm}"
@@ -34,6 +35,12 @@ default_key() {
 : "${MAX_STORAGE_PCT:=85}"
 : "${OWNER:=${USER:-box}}"
 : "${BOX_FORCE:=0}"
+: "${CONNECT_TIMEOUT:=5}"       # seconds to wait per Proxmox address before trying the other one
+: "${IDLE_RENEW:=1}"            # 1 = box commands and attached sessions renew a managed box's lease
+: "${MAX_LIFETIME:=7d}"         # activity never renews a lease past created + MAX_LIFETIME
+: "${GRACE:=10m}"               # host cleanup waits this long past expiry (short disconnects)
+: "${DESTROY_AFTER:=24h}"       # host cleanup destroys a stopped box this long after expiry
+: "${RECONNECT_TRIES:=40}"      # 'box ssh' reconnect attempts after a lost connection (2s apart)
 
 die() { echo "box: $*" >&2; exit 1; }
 log() { echo "box: $*" >&2; }
@@ -45,8 +52,20 @@ set -Eeuo pipefail
 die() { echo "box: $*" >&2; exit 1; }
 log() { echo "box: $*" >&2; }
 now() { date +%s; }
-conf_of() { echo "/etc/pve/lxc/$1.conf"; }
+PVE_ETC=${PVE_ETC:-/etc/pve}; LOCK_DIR=${LOCK_DIR:-/run/lock}; BOX_VAR=${BOX_VAR:-/var/lib/box}
+: "${MAX_LIFETIME_S:=604800}" "${GRACE_S:=600}" "${DESTROY_AFTER_S:=86400}"
+conf_of() { echo "$PVE_ETC/lxc/$1.conf"; }
 top_conf() { sed '/^\[/,$d' "$(conf_of "$1")"; }
+
+# Per-container lifecycle lock (fd 8). Every operation that stops, starts, renews or destroys a box
+# holds it, so cleanup can never act on a box that a client is resuming or renewing at that moment.
+# lock_id <id> <wait-seconds>   (0 = do not wait)
+lock_id() {
+  mkdir -p "$LOCK_DIR"
+  exec 8>"$LOCK_DIR/box-ct-$1.lock"
+  if [ "${2:-60}" = 0 ]; then flock -n 8; else flock -w "${2:-60}" 8; fi
+}
+unlock_id() { exec 8>&-; }
 
 is_box() {
   [[ ${1:-} =~ ^[0-9]+$ ]] || return 1
@@ -59,7 +78,7 @@ guard() {
 }
 list_ids() {
   local f id
-  for f in /etc/pve/lxc/*.conf; do
+  for f in "$PVE_ETC"/lxc/*.conf; do
     [ -e "$f" ] || continue
     id=${f##*/}; id=${id%.conf}
     if is_box "$id"; then echo "$id"; fi
@@ -67,6 +86,18 @@ list_ids() {
   return 0
 }
 status_of() { pct status "$1" | awk '{print $2}'; }
+
+# Registry: a host-side record written when box creates (or adopts) a CT. Automatic cleanup acts only
+# when the registry and the CT's own metadata agree, so a CT that merely looks like a box is never touched.
+reg_file() { echo "$BOX_VAR/registry/$1"; }
+reg_write() { mkdir -p "$BOX_VAR/registry"; printf 'owner=%s created=%s\n' "$2" "$3" >"$(reg_file "$1")"; }
+registered() {
+  local f c
+  f=$(reg_file "$1"); [ -f "$f" ] || return 1
+  c=$(desc_field "$1" created)
+  [ -n "$c" ] && grep -q " created=$c\$" "$f" && grep -q 'box1' <<<"$(top_conf "$1")"
+}
+snap_count() { pct listsnapshot "$1" 2>/dev/null | awk 'NF && $2 != "current"' | wc -l | tr -d ' '; }
 expires_of() { top_conf "$1" | sed -n 's/.*expires_\([0-9][0-9]*\).*/\1/p' | sed -n 1p; }
 desc_field() { top_conf "$1" | sed -n "s/.*$2_\([A-Za-z0-9._-]*\).*/\1/p" | sed -n 1p; }
 fmt_rem() {
@@ -142,7 +173,16 @@ backup_exclude() {
     }' "$op" "$id" "$ID_MIN" "$ID_MAX" $(list_ids))
 }
 
-set_desc() { pct set "$1" --description "box1 owner_$2 expires_$3 name_$4" >/dev/null; }
+# set_desc <id> <owner> <expires> <name> <ttl> <created> [req]
+set_desc() { pct set "$1" --description "box1 owner_$2 expires_$3 name_$4 ttl_$5 created_$6${7:+ req_$7}" >/dev/null; }
+
+find_req() {
+  local id
+  for id in $(list_ids); do
+    if [ "$(desc_field "$id" req)" = "$1" ]; then echo "$id"; return 0; fi
+  done
+  return 1
+}
 
 NEW_ID=""
 r_new_cleanup() {
@@ -152,36 +192,50 @@ r_new_cleanup() {
   pct stop "$NEW_ID" >/dev/null 2>&1 || true
   pct destroy "$NEW_ID" --purge --destroy-unreferenced-disks 1 >/dev/null 2>&1 || true
   backup_exclude remove "$NEW_ID" || true
+  rm -f "$(reg_file "$NEW_ID")"
 }
 
+# r_new <name> <cores> <mem> <disk> <ttl> <owner> <gpu> <req>
+# A dropped client connection must not kill a creation half way: ignore HUP/PIPE and keep stderr alive.
+# The client reconciles by <req> (see r_reconcile) instead of ever repeating the creation.
 r_new() {
-  local name=$1 cores=$2 mem=$3 disk=$4 ttl=$5 owner=$6 gpu=$7 id="" i hn exp cur ip
+  local name=$1 cores=$2 mem=$3 disk=$4 ttl=$5 owner=$6 gpu=$7 req=${8:-} id="" i hn exp cur ip created
   local clone_args=(--full 0)
+  trap '' HUP PIPE
+  exec 2> >(while IFS= read -r l; do printf '%s\n' "$l" >&2 2>/dev/null || :; done)
   [ -f "$(conf_of "$GOLDEN_CTID")" ] || die "golden CT $GOLDEN_CTID missing; run: box golden build"
   grep -q '^template: 1' <<<"$(top_conf "$GOLDEN_CTID")" || die "CT $GOLDEN_CTID is not a template"
   [ "$FULL_CLONE" = 1 ] && clone_args=(--full 1 --storage "$STORAGE")
   if [ "$gpu" = 1 ]; then [ -e /dev/dri/renderD128 ] || die "/dev/dri/renderD128 missing on host"; fi
 
-  exec 9>/run/lock/box.lock
+  mkdir -p "$LOCK_DIR"
+  exec 9>"$LOCK_DIR/box.lock"
   flock -w 120 9 || die "could not take box lock"
+  if [ -n "$req" ] && id=$(find_req "$req"); then
+    log "request $req already created CT $id"; exec 9>&-
+    echo "$id $(wait_ready "$id")"; return 0
+  fi
+  id=""
   guard_resources "$mem"
   for ((i=ID_MIN; i<=ID_MAX; i++)); do
-    if ! compgen -G "/etc/pve/nodes/*/lxc/$i.conf" >/dev/null \
-       && ! compgen -G "/etc/pve/nodes/*/qemu-server/$i.conf" >/dev/null \
+    if ! compgen -G "$PVE_ETC/nodes/*/lxc/$i.conf" >/dev/null \
+       && ! compgen -G "$PVE_ETC/nodes/*/qemu-server/$i.conf" >/dev/null \
        && pvesh get /cluster/nextid --vmid "$i" >/dev/null 2>&1; then id=$i; break; fi
   done
   [ -n "$id" ] || die "no free ID in $ID_MIN-$ID_MAX (run 'box gc')"
   hn=${name:-box-$id}
-  exp=$(( $(now) + ttl ))
+  created=$(now); exp=$(( created + ttl ))
 
   # Exclude the id from all-guest backup jobs before the CT exists, so no job can ever see it.
   NEW_ID=$id
   trap r_new_cleanup ERR
   backup_exclude add "$id"
+  rm -f "$(reg_file "$id")"   # a stale record from a reused id must never vouch for a new CT
   pct clone "$GOLDEN_CTID" "$id" --hostname "$hn" "${clone_args[@]}" >&2
   pct set "$id" --tags box --onboot 0 --swap 0 --cores "$cores" --memory "$mem" \
     --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp,firewall=0,type=veth" >&2
-  set_desc "$id" "$owner" "$exp" "$hn"
+  set_desc "$id" "$owner" "$exp" "$hn" "$ttl" "$created" "$req"
+  reg_write "$id" "$owner" "$created"
   cur=$(top_conf "$id" | sed -n 's/^rootfs:.*size=\([0-9]*\)G.*/\1/p')
   if [ -n "$cur" ] && [ "$disk" -gt "$cur" ]; then pct resize "$id" rootfs "${disk}G" >&2
   elif [ -n "$cur" ] && [ "$disk" -lt "$cur" ]; then log "note: golden rootfs is ${cur}G; cannot shrink to ${disk}G"; fi
@@ -194,36 +248,110 @@ r_new() {
   echo "$id $ip"
 }
 
+# Where did request <req> get to? Prints one of: none | building | ready <id> <ip> | partial <id>
+r_reconcile() {
+  local id ip
+  mkdir -p "$LOCK_DIR"
+  if id=$(find_req "$1"); then
+    if [ "$(status_of "$id")" = running ] && ip=$(ct_ip "$id") && [ -n "$ip" ]; then echo "ready $id $ip"; return 0; fi
+    exec 9>"$LOCK_DIR/box.lock"
+    if flock -n 9; then echo "partial $id"; else echo "building"; fi
+    return 0
+  fi
+  exec 9>"$LOCK_DIR/box.lock"
+  if flock -n 9; then echo none; else echo building; fi
+}
+
+# Set a box's lease to at least <seconds> from now. mode=auto caps at created+MAX_LIFETIME and leaves
+# legacy boxes (no lease metadata) alone; mode=force (explicit user request) adopts legacy boxes.
+lease_extend() {
+  local id=$1 secs=$2 mode=$3 ttl created exp new owner name
+  ttl=$(desc_field "$id" ttl); created=$(desc_field "$id" created)
+  owner=$(desc_field "$id" owner); name=$(desc_field "$id" name)
+  if [ -z "$ttl" ] || [ -z "$created" ]; then
+    [ "$mode" = force ] || return 0
+    ttl=$secs; created=$(now)
+  fi
+  exp=$(expires_of "$id" || true)
+  new=$(( $(now) + secs ))
+  if [ "$mode" = auto ] && [ "$new" -gt $((created + MAX_LIFETIME_S)) ]; then new=$((created + MAX_LIFETIME_S)); fi
+  [ "$new" -gt "${exp:-0}" ] || return 0
+  set_desc "$id" "${owner:-unknown}" "$new" "${name:-box-$id}" "$ttl" "$created" "$(desc_field "$id" req)"
+  [ -f "$(reg_file "$id")" ] || reg_write "$id" "${owner:-unknown}" "$created"
+}
+
+# Activity renewal. Silent and best effort: a busy or legacy box is simply left alone.
+renew_quiet() {
+  local id=$1 ttl
+  [ "${LEASE_RENEW:-1}" = 1 ] || return 0
+  ttl=$(desc_field "$id" ttl)
+  [ -n "$ttl" ] || return 0
+  if lock_id "$id" 2; then lease_extend "$id" "$ttl" auto || true; unlock_id; fi
+  return 0
+}
+r_renew() { guard "$1"; renew_quiet "$1"; }
+# Explicit: box extend / box job run. Honours the request, adopts legacy boxes.
+r_extend() {
+  guard "$1"
+  lock_id "$1" 60 || die "CT $1 is busy"
+  lease_extend "$1" "$2" force
+  unlock_id
+  echo "$1 expires in $(fmt_rem "$(expires_of "$1")")"
+}
+# Adopt legacy boxes (created before leases existed) so cleanup may manage them.
+r_adopt() {
+  local id=$1 ttl=$2 ids
+  if [ "$id" = all ]; then ids=$(list_ids); else guard "$id"; ids=$id; fi
+  for id in $ids; do
+    if [ -n "$(desc_field "$id" ttl)" ] && registered "$id"; then echo "$id: already managed"; continue; fi
+    lock_id "$id" 60 || { echo "$id: busy"; continue; }
+    lease_extend "$id" "$ttl" force
+    echo "$id: adopted (lease ${ttl}s, expires in $(fmt_rem "$(expires_of "$id")"))"
+    unlock_id
+  done
+}
+
+r_lease() {
+  guard "$1"
+  echo "id=$1 expires=$(expires_of "$1" || true) ttl=$(desc_field "$1" ttl) created=$(desc_field "$1" created) registered=$(registered "$1" && echo yes || echo no) tmux=$(pct exec "$1" -- sh -c 'command -v tmux >/dev/null && echo yes || echo no' </dev/null 2>/dev/null || echo unknown)"
+}
+
 r_resume() {
-  local id=$1 ttl=$2 mem owner name ip
+  local id=$1 ttl=$2 mem owner name ip created reqid
+  guard "$id"
+  lock_id "$id" 120 || die "CT $id is busy"
   guard "$id"
   mem=$(top_conf "$id" | sed -n 's/^memory: *//p')
   owner=$(desc_field "$id" owner); name=$(desc_field "$id" name)
+  created=$(desc_field "$id" created); [ -n "$created" ] || created=$(now)
+  reqid=$(desc_field "$id" req)
+  # Renew the lease BEFORE starting: from here on cleanup (which takes the same lock) sees a live lease.
+  set_desc "$id" "${owner:-unknown}" "$(( $(now) + ttl ))" "${name:-box-$id}" "$ttl" "$created" "$reqid"
+  [ -f "$(reg_file "$id")" ] || reg_write "$id" "${owner:-unknown}" "$created"
   if [ "$(status_of "$id")" != running ]; then
-    exec 9>/run/lock/box.lock; flock -w 120 9
+    exec 9>"$LOCK_DIR/box.lock"; flock -w 120 9
     guard_resources "${mem:-1024}"
     pct start "$id" >&2
     exec 9>&-
   fi
-  set_desc "$id" "${owner:-unknown}" "$(( $(now) + ttl ))" "${name:-box-$id}"
+  unlock_id
   ip=$(wait_ready "$id")
   echo "$id $ip"
 }
 
-r_stop() {
-  guard "$1"
-  if [ "$(status_of "$1")" = running ]; then pct shutdown "$1" --timeout 30 >&2 || pct stop "$1" >&2; fi
-}
-
-r_kill() {
-  guard "$1"
+stop_ct() { if [ "$(status_of "$1")" = running ]; then pct shutdown "$1" --timeout 30 >&2 || pct stop "$1" >&2; fi; }
+kill_ct() {
   if [ "$(status_of "$1")" = running ]; then pct stop "$1" >&2; fi
   pct destroy "$1" --purge --destroy-unreferenced-disks 1 >&2
   backup_exclude remove "$1"
+  rm -f "$(reg_file "$1")"
 }
+r_stop() { guard "$1"; lock_id "$1" 120 || die "CT $1 is busy"; stop_ct "$1"; unlock_id; }
+r_kill() { guard "$1"; lock_id "$1" 120 || die "CT $1 is busy"; kill_ct "$1"; unlock_id; }
 
-r_ip() { guard "$1"; [ "$(status_of "$1")" = running ] || die "CT $1 is not running"; ct_ip "$1"; }
+r_ip() { guard "$1"; [ "$(status_of "$1")" = running ] || die "CT $1 is not running"; renew_quiet "$1"; ct_ip "$1"; }
 r_guard() { guard "$1"; }
+r_touch() { guard "$1"; renew_quiet "$1"; }
 
 r_list() {
   local id st ip exp rem cores mem name
@@ -239,7 +367,31 @@ r_list() {
   echo "# host: MemAvailable=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)MB SwapFree=$(awk '/^SwapFree:/{print int($2/1024)}' /proc/meminfo)MB" >&2
 }
 
-# mode: list (dry run) | stop | destroy
+# Act on one expired box, but only after taking its lock and re-checking everything under it:
+# still a box, still expired (a renewal or resume since the scan wins), and for automatic runs
+# (require_reg=1) registered, with no snapshots in the way of a destroy.
+# reap_one <id> stop|destroy <grace-seconds> <require_reg>
+reap_one() {
+  local id=$1 action=$2 grace=$3 reqreg=$4 exp
+  lock_id "$id" 0 || { echo "busy $id: left alone"; return 0; }
+  if ! is_box "$id"; then echo "skip $id: no longer a box"; unlock_id; return 0; fi
+  exp=$(expires_of "$id" || true)
+  if [ -z "$exp" ] || [ "$(now)" -le $((exp + grace)) ]; then echo "skip $id: lease renewed"; unlock_id; return 0; fi
+  if [ "$reqreg" = 1 ] && ! registered "$id"; then
+    echo "skip $id: not in the registry (legacy box; 'box adopt $id' to let cleanup manage it)"; unlock_id; return 0
+  fi
+  case "$action" in
+    stop)
+      if [ "$(status_of "$id")" = running ]; then echo "stopping expired $id"; stop_ct "$id"; fi ;;
+    destroy)
+      if [ "$reqreg" = 1 ] && [ "$(snap_count "$id")" -gt 0 ]; then
+        echo "hold $id: has snapshots; destroy it by hand with 'box kill $id' if intended"
+      else echo "destroying expired $id"; kill_ct "$id"; fi ;;
+  esac
+  unlock_id
+}
+
+# Manual 'box gc'. mode: list (dry run) | stop | destroy
 r_gc() {
   local mode=$1 id exp st n=0
   for id in $(list_ids); do
@@ -248,12 +400,94 @@ r_gc() {
     st=$(status_of "$id"); n=$((n+1))
     case "$mode" in
       list) echo "expired: $id ($st)" ;;
-      stop) if [ "$st" = running ]; then echo "stopping expired $id"; r_stop "$id"; fi ;;
-      destroy) echo "destroying expired $id"; r_kill "$id" ;;
+      stop|destroy) reap_one "$id" "$mode" 0 0 ;;
     esac
   done
   [ "$mode" = list ] || backup_exclude prune
   echo "expired boxes: $n"
+}
+
+# Unattended cleanup, run by the host's systemd timer.
+# mode: report (default, only says what it would do) | stop | destroy (stop, then destroy later).
+# Timeline per box: expires_at -> +GRACE: stop -> +DESTROY_AFTER: destroy. Snapshots hold a destroy.
+r_cleanup() {
+  local mode=${1:-} id exp st t action n=0 f rid
+  if [ -z "$mode" ]; then mode=$(cat /etc/box/cleanup.mode 2>/dev/null || echo report); fi
+  case "$mode" in report|stop|destroy) ;; *) die "cleanup: bad mode '$mode'";; esac
+  mkdir -p "$BOX_VAR"
+  t=$(now)
+  echo "box cleanup mode=$mode at $(date -u +%FT%TZ) grace=${GRACE_S}s destroy_after=${DESTROY_AFTER_S}s"
+  for id in $(list_ids); do
+    exp=$(expires_of "$id" || true)
+    [ -n "$exp" ] && [ "$t" -gt $((exp + GRACE_S)) ] || continue
+    st=$(status_of "$id"); n=$((n+1))
+    if [ "$st" = running ]; then action=stop
+    elif [ "$t" -gt $((exp + DESTROY_AFTER_S)) ]; then action=destroy
+    else action=wait; fi
+    if [ "$mode" = report ] || [ "$action" = wait ] || { [ "$mode" = stop ] && [ "$action" = destroy ]; }; then
+      echo "report $id ($st): expired $(( (t - exp) / 60 ))m ago, next step: $action$( registered "$id" || echo ' [unregistered: would be skipped]')"
+    else
+      reap_one "$id" "$action" "$GRACE_S" 1
+    fi
+  done
+  # Registry entries whose CT no longer exists are stale; drop them (not while a creation is running).
+  if [ -d "$BOX_VAR/registry" ] && [ "$mode" != report ]; then
+    mkdir -p "$LOCK_DIR"; exec 9>"$LOCK_DIR/box.lock"
+    if flock -n 9; then
+      for f in "$BOX_VAR/registry"/*; do
+        [ -e "$f" ] || continue; rid=${f##*/}
+        is_box "$rid" || { echo "dropping stale registry entry $rid"; rm -f "$f"; }
+      done
+      backup_exclude prune
+    fi
+    exec 9>&-
+  fi
+  echo "expired boxes: $n"
+}
+
+# Install the cleanup helper + systemd timer on the PVE host. stdin = the helper script.
+# r_install_host [mode]  (mode kept from the previous install when omitted; first install = report)
+r_install_host() {
+  local mode=${1:-}
+  mkdir -p /etc/box /usr/local/sbin
+  if [ -z "$mode" ]; then mode=$(cat /etc/box/cleanup.mode 2>/dev/null || echo report); fi
+  case "$mode" in report|stop|destroy) ;; *) die "install: bad mode '$mode'";; esac
+  cat >/usr/local/sbin/box-host.new
+  chmod 700 /usr/local/sbin/box-host.new
+  mv -f /usr/local/sbin/box-host.new /usr/local/sbin/box-host
+  printf '%s\n' "$mode" >/etc/box/cleanup.mode
+  cat >/etc/systemd/system/box-cleanup.service <<'UNIT'
+[Unit]
+Description=box: lease cleanup for ephemeral containers
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/box-host cleanup
+UNIT
+  cat >/etc/systemd/system/box-cleanup.timer <<'UNIT'
+[Unit]
+Description=box: run lease cleanup every 5 minutes
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now box-cleanup.timer >&2
+  echo "installed: box-cleanup.timer, mode=$mode"
+}
+r_cleanup_status() {
+  echo "mode: $(cat /etc/box/cleanup.mode 2>/dev/null || echo 'not installed')"
+  echo "timer: $(systemctl is-active box-cleanup.timer 2>/dev/null || true) / $(systemctl is-enabled box-cleanup.timer 2>/dev/null || true)"
+  systemctl list-timers box-cleanup.timer --no-pager 2>/dev/null | sed -n '2p' || true
+  journalctl -u box-cleanup.service -n 8 --no-pager -o cat 2>/dev/null || true
+}
+r_set_cleanup_mode() {
+  case "${1:-}" in report|stop|destroy) ;; *) die "bad mode '${1:-}'";; esac
+  [ -x /usr/local/sbin/box-host ] || die "cleanup helper not installed; run: box cleanup install"
+  printf '%s\n' "$1" >/etc/box/cleanup.mode
+  echo "cleanup mode: $1"
 }
 
 # GUI screenshot: PNG bytes on stdout
@@ -261,6 +495,7 @@ r_shot() {
   local id=$1 tmp
   guard "$id"
   [ "$(status_of "$id")" = running ] || die "CT $id is not running"
+  renew_quiet "$id"
   pct exec "$id" -- bash -lc 'systemctl start box-xvfb box-openbox; sleep 1; DISPLAY=:99 scrot -o /tmp/box-shot.png' </dev/null >&2
   tmp=$(mktemp /tmp/box-shot.XXXXXX)
   pct pull "$id" /tmp/box-shot.png "$tmp" >&2
@@ -278,7 +513,7 @@ r_check() {
     if grep -q '^template: 1' <<<"$(top_conf "$GOLDEN_CTID")"; then echo "golden: ok (CT $GOLDEN_CTID template)"; else echo "golden: CT $GOLDEN_CTID exists but is NOT a template"; fi
   else echo "golden: absent -> run 'box golden build'"; fi
   local f id foreign=""
-  for f in /etc/pve/nodes/*/lxc/*.conf /etc/pve/nodes/*/qemu-server/*.conf; do
+  for f in "$PVE_ETC"/nodes/*/lxc/*.conf "$PVE_ETC"/nodes/*/qemu-server/*.conf; do
     [ -e "$f" ] || continue; id=${f##*/}; id=${id%.conf}
     if [ "$id" -ge "$ID_MIN" ] && [ "$id" -le "$ID_MAX" ] && ! is_box "$id"; then foreign="$foreign $id"; fi
   done
@@ -323,6 +558,30 @@ r_doctor() {
   echo "info	rootfs is always part of a container backup (PVE ignores backup=0 on it); the job exclusions above are the guard"
   grep -q '^FAIL' <<<"$out" && bad=1
   [ "$bad" = 0 ] || exit 1
+}
+
+# Host-side health for 'box doctor'. One "ok|warn|FAIL<TAB>message" per line.
+r_hostcheck() {
+  local c id mode legacy=0 notmux=""
+  for c in pct pvesh pvesm perl flock systemctl; do
+    if command -v "$c" >/dev/null 2>&1; then echo "ok	host command: $c"; else echo "FAIL	host command missing: $c"; fi
+  done
+  if pvesm status --storage "$STORAGE" >/dev/null 2>&1; then echo "ok	storage $STORAGE"; else echo "FAIL	storage $STORAGE not found"; fi
+  if ip link show "$BRIDGE" >/dev/null 2>&1; then echo "ok	bridge $BRIDGE"; else echo "FAIL	bridge $BRIDGE missing"; fi
+  if r_guard_golden; then echo "ok	golden CT $GOLDEN_CTID is a template"; else echo "FAIL	golden CT $GOLDEN_CTID missing or not a template (box golden build)"; fi
+  if [ -x /usr/local/sbin/box-host ] && systemctl is-active --quiet box-cleanup.timer 2>/dev/null; then
+    mode=$(cat /etc/box/cleanup.mode 2>/dev/null || echo '?')
+    echo "ok	cleanup timer active, mode=$mode"
+    [ "$mode" != report ] || echo "warn	cleanup is report-only: expired boxes are listed, never stopped (box cleanup mode stop|destroy)"
+  else echo "warn	cleanup timer not installed: expired boxes stay until 'box gc' (box cleanup install)"; fi
+  for id in $(list_ids); do
+    if [ -z "$(desc_field "$id" ttl)" ] || ! registered "$id"; then legacy=$((legacy+1)); fi
+    if [ "$(status_of "$id")" = running ] && ! pct exec "$id" -- sh -c 'command -v tmux >/dev/null' </dev/null >/dev/null 2>&1; then notmux="$notmux $id"; fi
+  done
+  [ "$legacy" = 0 ] && echo "ok	every box has a lease and a registry entry" \
+    || echo "warn	$legacy box(es) predate leases: cleanup skips them until 'box adopt all'"
+  [ -z "$notmux" ] && echo "ok	tmux present in every running box" \
+    || echo "warn	no tmux in running box(es):$notmux ('box ssh' installs it on demand, or rebuild the golden)"
 }
 
 r_guard_golden() {
@@ -370,7 +629,7 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export HOME=/root PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin   # pct exec has no /usr/local/bin
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl git openssh-server sudo procps iproute2 \
+apt-get install -y --no-install-recommends ca-certificates curl git openssh-server sudo procps iproute2 tmux \
   iputils-ping dnsutils netcat-openbsd file less zip unzip jq ripgrep rsync locales build-essential pkg-config \
   python3 python3-pip python3-venv
 apt-get install -y --no-install-recommends xvfb openbox xdotool scrot x11-utils x11-xserver-utils libnss3 libgbm1 \
@@ -462,15 +721,74 @@ REMOTE_EOF
 
 # ---------------------------------------------------------------- plumbing
 mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
-SSH_PVE=(-o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto -o "ControlPath=$STATE_DIR/cm-%C" -o ControlPersist=60)
+# One pinned identity for both addresses of the Proxmox host (HostKeyAlias): a key learned on the LAN
+# address must match over Tailscale and vice versa, and a changed key is refused, never silently accepted.
+SSH_PVE=(-o BatchMode=yes -o "ConnectTimeout=$CONNECT_TIMEOUT" -o ServerAliveInterval=10 -o ServerAliveCountMax=3
+  -o HostKeyAlias=box-pve -o "UserKnownHostsFile=$STATE_DIR/known_hosts_pve" -o StrictHostKeyChecking=accept-new
+  -o ControlMaster=auto -o "ControlPath=$STATE_DIR/cm-%C" -o ControlPersist=60)
 
-need_host() { [ -n "$PVE_HOST" ] || die "not configured; run: box init --host root@<pve-ip>"; }
+PVE_ACTIVE=""
+host_of() { local h=${1#*@}; h=${h#\[}; printf '%s' "${h%%\]*}"; }
+file_age() { local m; m=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null) || return 1; echo $(( $(date +%s) - m )); }
+# A control connection to an address that just went away can hang a probe for ~30s (until keepalives
+# give up). Bound the probe, and when it fails drop the stale master so the next attempt starts clean.
+pve_probe() {
+  local rc=0 to=$((CONNECT_TIMEOUT + 3))
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$to" ssh -n "${SSH_PVE[@]}" "$1" true >/dev/null 2>&1 || rc=$?
+  else
+    ssh -n "${SSH_PVE[@]}" "$1" true >/dev/null 2>&1 || rc=$?
+  fi
+  [ "$rc" -eq 0 ] || ssh -O exit "${SSH_PVE[@]}" "$1" >/dev/null 2>&1 || true
+  return "$rc"
+}
+
+# route_try: pick the address to use, LAN (PVE_HOST) first. After a fallback the alternate is tried first
+# for 30s so every command does not pay a connect timeout, then LAN is probed again and wins when back.
+# Sets PVE_ACTIVE and records it in $STATE_DIR/route. Returns 1 when nothing answers.
+route_try() {
+  local order=("$PVE_HOST") last="" age
+  [ -n "$PVE_HOST" ] || return 1
+  [ -z "$PVE_HOST_ALT" ] || order+=("$PVE_HOST_ALT")
+  if [ -n "$PVE_HOST_ALT" ] && [ -s "$STATE_DIR/route" ]; then
+    last=$(cat "$STATE_DIR/route"); age=$(file_age "$STATE_DIR/route" || echo 999)
+    if [ "$last" = "$PVE_HOST_ALT" ] && [ "$age" -lt 30 ]; then order=("$PVE_HOST_ALT" "$PVE_HOST"); fi
+  fi
+  local h
+  for h in "${order[@]}"; do
+    if pve_probe "$h"; then
+      PVE_ACTIVE=$h
+      if [ "$h" != "$last" ] && [ -n "$last" ]; then
+        if [ "$h" = "$PVE_HOST" ]; then log "route: back on LAN ($h)"; else log "route: LAN unreachable, using alternate ($h)"; fi
+      fi
+      printf '%s' "$h" >"$STATE_DIR/route"
+      return 0
+    fi
+  done
+  return 1
+}
+route() {
+  [ -z "$PVE_ACTIVE" ] || return 0
+  [ -n "$PVE_HOST" ] || die "not configured; run: box init --host root@<pve-ip>"
+  route_try || die "cannot reach Proxmox at $PVE_HOST${PVE_HOST_ALT:+ or $PVE_HOST_ALT} (is the network or Tailscale up? try: box doctor)"
+}
+need_host() { route; }
+
+# True when both addresses present at least one identical host key (they are the same machine).
+same_host_key() {
+  local a b
+  a=$(ssh-keyscan -T 5 "$(host_of "$1")" 2>/dev/null | awk '$1 !~ /^#/ && NF>=3{print $2" "$3}' | sort -u)
+  b=$(ssh-keyscan -T 5 "$(host_of "$2")" 2>/dev/null | awk '$1 !~ /^#/ && NF>=3{print $2" "$3}' | sort -u)
+  [ -n "$a" ] && [ -n "$b" ] && [ -n "$(comm -12 <(printf '%s\n' "$a") <(printf '%s\n' "$b"))" ]
+}
 
 remote_env() {
   local v
   for v in GOLDEN_CTID ID_MIN ID_MAX STORAGE BRIDGE TEMPLATE_VOLID FULL_CLONE MAX_RUNNING MIN_FREE_MB MIN_SWAP_FREE_MB MAX_STORAGE_PCT BOX_FORCE; do
     printf '%s=%q\n' "$v" "${!v}"
   done
+  printf 'LEASE_RENEW=%q\nMAX_LIFETIME_S=%q\nGRACE_S=%q\nDESTROY_AFTER_S=%q\n' \
+    "$IDLE_RENEW" "$(ttl_seconds "$MAX_LIFETIME")" "$(ttl_seconds "$GRACE")" "$(ttl_seconds "$DESTROY_AFTER")"
 }
 
 # rcall <fn> [args...]: run r_<fn> on the PVE host. stdout = result, stderr = progress.
@@ -478,11 +796,31 @@ rcall() {
   need_host
   local script
   script="$(remote_env)"$'\n'"$REMOTE_LIB"
-  ssh -n "${SSH_PVE[@]}" "$PVE_HOST" "bash -c $(printf '%q' "$script") box-remote $(printf '%q ' "$@")"
+  ssh -n "${SSH_PVE[@]}" "$PVE_ACTIVE" "bash -c $(printf '%q' "$script") box-remote $(printf '%q ' "$@")"
+}
+# rcall_in: like rcall but forwards stdin (used to ship the host helper).
+rcall_in() {
+  need_host
+  local script
+  script="$(remote_env)"$'\n'"$REMOTE_LIB"
+  ssh "${SSH_PVE[@]}" "$PVE_ACTIVE" "bash -c $(printf '%q' "$script") box-remote $(printf '%q ' "$@")"
 }
 
 # pve <cmd...>: run a command on the PVE host with arguments preserved.
-pve() { need_host; ssh "${SSH_PVE[@]}" "$PVE_HOST" "$(printf '%q ' "$@")"; }
+pve() { need_host; ssh "${SSH_PVE[@]}" "$PVE_ACTIVE" "$(printf '%q ' "$@")"; }
+
+# ct_ssh_opts <id>: options for ssh/scp/rsync to a box through the PVE host, using the active route.
+# The jump hop reuses the pinned host key and keepalives; the box key follows the CT id, not its DHCP address.
+CT_OPTS=()
+ct_ssh_opts() {
+  local id=$1 jump="$STATE_DIR/jump.sh"
+  printf '#!/bin/sh\nexec ssh -o BatchMode=yes -o ConnectTimeout="$BOX_CONNECT_TIMEOUT" -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o HostKeyAlias=box-pve -o UserKnownHostsFile="$BOX_STATE/known_hosts_pve" -o StrictHostKeyChecking=accept-new -o ControlMaster=auto -o ControlPath="$BOX_STATE/cm-%%C" -o ControlPersist=60 -W "$1:$2" "$BOX_JUMP_HOST"\n' >"$jump.new"
+  chmod 700 "$jump.new"; mv -f "$jump.new" "$jump"
+  export BOX_JUMP_HOST=$PVE_ACTIVE BOX_STATE=$STATE_DIR BOX_CONNECT_TIMEOUT=$CONNECT_TIMEOUT
+  CT_OPTS=(-o "ProxyCommand=$jump %h %p" -i "$SSH_KEY" -o "UserKnownHostsFile=$(known_hosts "$id")"
+    -o "HostKeyAlias=box-$id" -o StrictHostKeyChecking=accept-new -o "ConnectTimeout=$CONNECT_TIMEOUT"
+    -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
+}
 
 ttl_seconds() {
   [[ $1 =~ ^([0-9]+)([smhd]?)$ ]] || die "bad ttl '$1' (use e.g. 90s 30m 2h 1d)"
@@ -561,19 +899,19 @@ with_spin() {
 
 # ---------------------------------------------------------------- commands
 cmd_init() {
-  local host="" key="" force=0 storage="" bridge="" golden="" tpl="" tui=0
+  local host="" key="" force=0 storage="" bridge="" golden="" tpl="" tui=0 alt=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --host) host=$2; shift 2;; --key) key=$2; shift 2;; --storage) storage=$2; shift 2;;
+      --host) host=$2; shift 2;; --alt) alt=$2; shift 2;; --key) key=$2; shift 2;; --storage) storage=$2; shift 2;;
       --bridge) bridge=$2; shift 2;; --golden) golden=$2; shift 2;; --template) tpl=$2; shift 2;;
       --force) force=1; shift;; *) die "init: unknown option $1";;
     esac
   done
   # Interactive TUI when run on a terminal with nothing (or only --force) to do.
   if [ -t 0 ] || [ -c /dev/tty ]; then
-    if [ -z "$host$key$storage$bridge$golden$tpl" ]; then tui=1; fi
+    if [ -z "$host$alt$key$storage$bridge$golden$tpl" ]; then tui=1; fi
   fi
-  if [ "$tui" = 0 ]; then cmd_init_plain "$host" "$key" "$force" "$storage" "$bridge" "$golden" "$tpl"; return; fi
+  if [ "$tui" = 0 ]; then cmd_init_plain "$host" "$key" "$force" "$storage" "$bridge" "$golden" "$tpl" "$alt"; return; fi
 
   tui_banner
   tui_step "1/4" "Where is your Proxmox?"
@@ -600,6 +938,10 @@ cmd_init() {
     fi
   fi
   tui_ok "SSH to $host works"
+  PVE_HOST=$host
+  alt=$(discover_alt "$host" "${PVE_HOST_ALT:-}")
+  if [ -n "$alt" ]; then tui_ok "Tailscale fallback verified: $alt (same host key as $host)"
+  else tui_info "${C_DIM}No Tailscale fallback (needs tailscale up on both machines). Add later: box init --alt root@<ts-ip> --force${C_RST}"; fi
 
   tui_step "3/4" "Confirm settings ${C_DIM}(Enter = default)${C_RST}"
   tui_ask storage "  Storage" "$STORAGE"
@@ -607,7 +949,7 @@ cmd_init() {
   tui_ask tpl "  LXC template volid" "$TEMPLATE_VOLID"
   tui_ask golden "  Golden CT id" "$GOLDEN_CTID"
 
-  cmd_init_write "$host" "$key" "$storage" "$bridge" "$golden" "$tpl"
+  cmd_init_write "$host" "$key" "$storage" "$bridge" "$golden" "$tpl" "$alt"
   # shellcheck disable=SC1090
   . "$CONFIG_FILE"
 
@@ -641,27 +983,52 @@ cmd_init() {
 
 # Non-interactive init (flags or piped). Same as the original behaviour.
 cmd_init_plain() {
-  local host=$1 key=$2 force=$3 storage=$4 bridge=$5 golden=$6 tpl=$7
+  local host=$1 key=$2 force=$3 storage=$4 bridge=$5 golden=$6 tpl=$7 alt=${8:-}
   if [ -f "$CONFIG_FILE" ] && [ "$force" = 0 ]; then
     log "config exists ($CONFIG_FILE); re-running read-only checks. Use --force to rewrite."
   else
-    cmd_init_write "${host:-${PVE_HOST:-}}" "$key" "$storage" "$bridge" "$golden" "$tpl"
+    [ -z "$alt" ] || { PVE_HOST=${host:-$PVE_HOST}; alt=$(discover_alt "$PVE_HOST" "$alt" 1); }
+    cmd_init_write "${host:-${PVE_HOST:-}}" "$key" "$storage" "$bridge" "$golden" "$tpl" "$alt"
     # shellcheck disable=SC1090
     . "$CONFIG_FILE"
   fi
   [ -f "$SSH_KEY.pub" ] || die "public key $SSH_KEY.pub not found (set SSH_KEY in $CONFIG_FILE)"
   log "checking $PVE_HOST (read-only)..."
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$PVE_HOST" true || die "cannot ssh to $PVE_HOST non-interactively (ssh-copy-id first)"
+  if [ -z "$PVE_HOST_ALT" ]; then
+    alt=$(discover_alt "$PVE_HOST" "" 2>/dev/null || true)
+    [ -z "$alt" ] || log "tip: Tailscale fallback available; save it with: box init --force --host $PVE_HOST --alt $alt"
+  fi
   rcall check
   log "next: box golden build   (creates CT $GOLDEN_CTID; only if 'golden: absent')"
 }
 
+# discover_alt <lan-host> [explicit-alt] [explicit-only]: print a verified Tailscale address for the same
+# Proxmox host, or nothing. Candidate = the given alt, else the Tailscale IPv4 reported by the host itself.
+# Verified = reachable over SSH and presenting the same host key as the LAN address.
+discover_alt() {
+  local lan=$1 cand=${2:-} only=${3:-0} user
+  user=${lan%@*}; [ "$user" != "$lan" ] || user=root
+  if [ -z "$cand" ] && [ "$only" = 0 ]; then
+    cand=$(ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$lan" 'command -v tailscale >/dev/null 2>&1 && tailscale ip -4 2>/dev/null | head -1' 2>/dev/null || true)
+    [[ $cand =~ ^[0-9.]+$ ]] || cand=""
+    [ -z "$cand" ] || cand="$user@$cand"
+  fi
+  [ -n "$cand" ] || return 0
+  if ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 "$cand" true >/dev/null 2>&1 && same_host_key "$lan" "$cand"; then
+    printf '%s' "$cand"
+  else
+    log "Tailscale candidate $cand is unreachable or presents a different host key; not saved"
+  fi
+}
+
 cmd_init_write() {
-  local host=$1 key=$2 storage=$3 bridge=$4 golden=$5 tpl=$6
+  local host=$1 key=$2 storage=$3 bridge=$4 golden=$5 tpl=$6 alt=${7:-}
   mkdir -p "$(dirname "$CONFIG_FILE")"
   cat >"$CONFIG_FILE" <<CFG
 # box config (sourced as shell). Written by 'box init'.
 PVE_HOST=${host:-${PVE_HOST:-}}
+PVE_HOST_ALT=${alt:-${PVE_HOST_ALT:-}}
 SSH_KEY=${key:-$SSH_KEY}
 TEMPLATE_VOLID=${tpl:-$TEMPLATE_VOLID}
 STORAGE=${storage:-$STORAGE}
@@ -679,6 +1046,12 @@ MIN_FREE_MB=$MIN_FREE_MB
 MIN_SWAP_FREE_MB=$MIN_SWAP_FREE_MB
 MAX_STORAGE_PCT=$MAX_STORAGE_PCT
 OWNER=$OWNER
+CONNECT_TIMEOUT=$CONNECT_TIMEOUT
+IDLE_RENEW=$IDLE_RENEW
+MAX_LIFETIME=$MAX_LIFETIME
+GRACE=$GRACE
+DESTROY_AFTER=$DESTROY_AFTER
+RECONNECT_TRIES=$RECONNECT_TRIES
 CFG
   chmod 600 "$CONFIG_FILE"
   log "wrote $CONFIG_FILE"
@@ -694,7 +1067,7 @@ cmd_golden() {
 }
 
 cmd_new() {
-  local cores=$DEFAULT_CORES mem=$DEFAULT_MEM disk=$DEFAULT_DISK ttl=$DEFAULT_TTL name="" gpu=0 owner=$OWNER tools="" out id ip
+  local cores=$DEFAULT_CORES mem=$DEFAULT_MEM disk=$DEFAULT_DISK ttl=$DEFAULT_TTL name="" gpu=0 owner=$OWNER tools="" out id ip req rc
   while [ $# -gt 0 ]; do
     case "$1" in
       --cores) cores=$2; shift 2;; --mem) mem=$2; shift 2;; --disk) disk=${2%G}; shift 2;;
@@ -707,11 +1080,39 @@ cmd_new() {
   [ -z "$name" ] || [[ $name =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "name must be lowercase [a-z0-9-]"
   owner=$(printf '%s' "$owner" | tr -c 'A-Za-z0-9._-' '-')
   [ -z "$tools" ] || [[ $tools =~ ^[A-Za-z0-9@._:/+\ -]+$ ]] || die "--tools: unexpected characters in '$tools'"
-  out=$(rcall new "$name" "$cores" "$mem" "$disk" "$(ttl_seconds "$ttl")" "$owner" "$gpu")
+  req="$(date +%s)$RANDOM$RANDOM"
+  rc=0; out=$(rcall new "$name" "$cores" "$mem" "$disk" "$(ttl_seconds "$ttl")" "$owner" "$gpu" "$req") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    [ "$rc" -eq 255 ] || exit "$rc"          # the host reported its own error: nothing to reconcile
+    out=$(new_recover "$req") || exit $?
+  fi
   read -r id ip <<<"$out"
+  rm -f "$(known_hosts "$id")"                # a reused id must never inherit the old box's host key
   printf '%s' "$id" >"$STATE_DIR/current"
   [ -z "$tools" ] || install_tools "$id" "$tools"
   echo "$id $ip"
+}
+
+# The connection dropped while a creation was in flight. Never repeat the creation: ask the host what
+# became of this request id. Prints "<id> <ip>" when it finished; otherwise says exactly what is left.
+new_recover() {
+  local req=$1 i st nones=0
+  log "connection lost during creation; checking request $req on the host (will not create a second box)"
+  for ((i=0; i<36; i++)); do
+    PVE_ACTIVE=""
+    if route_try && st=$(rcall reconcile "$req" 2>/dev/null); then
+      case "$st" in
+        ready*) log "creation finished on the host"; echo "${st#ready }"; return 0;;
+        partial*) log "request created CT ${st#partial } but it is not running; inspect it: box list, box resume ${st#partial }, or box kill ${st#partial } -f"; return 3;;
+        none) nones=$((nones+1))
+              if [ "$nones" -ge 3 ]; then log "nothing was created for this request; it is safe to run 'box new' again"; return 4; fi;;
+        *) nones=0;;
+      esac
+    fi
+    sleep 5
+  done
+  log "host unreachable or still busy after 3 minutes; check 'box list' before retrying (request $req)"
+  return 5
 }
 
 # Install runtimes with mise inside a box. Bootstraps mise when the golden image predates it.
@@ -730,33 +1131,247 @@ EOS
   pve pct exec "$id" -- env LC_ALL=C.UTF-8 bash -lc "$script" >&2
 }
 
+# Keep the lease of a box alive while a long command or an attached session runs.
+KEEPALIVE_PID=""
+keepalive_start() {
+  [ "$IDLE_RENEW" = 1 ] || return 0
+  local id=$1
+  # Detached from the caller's stdio (an inherited stdout would keep 'box exec | cmd' open until the next
+  # tick) and it reaps its own sleep when stopped.
+  (
+    trap 'kill $(jobs -p) 2>/dev/null; exit 0' TERM
+    while :; do
+      sleep "${KEEPALIVE_INTERVAL:-300}" & wait $!
+      PVE_ACTIVE=""; route_try && rcall renew "$id" >/dev/null 2>&1 || true
+    done
+  ) >/dev/null 2>&1 </dev/null &
+  KEEPALIVE_PID=$!
+}
+keepalive_stop() {
+  [ -z "$KEEPALIVE_PID" ] || { kill "$KEEPALIVE_PID" 2>/dev/null || true; wait "$KEEPALIVE_PID" 2>/dev/null || true; KEEPALIVE_PID=""; }
+}
+
 cmd_exec() {
-  local id cmd
+  local id cmd rc=0
   id=$(resolve_id "${1:-current}"); shift || true
   [ "${1:-}" = -- ] && shift
   [ $# -gt 0 ] || die "usage: box exec <id|current> -- <cmd...>"
-  rcall guard "$id"
+  rcall touch "$id"
   if [ $# -eq 1 ]; then cmd=$1; else cmd=$(printf '%q ' "$@"); fi
-  pve pct exec "$id" -- env LC_ALL=C.UTF-8 bash -lc "$cmd"
+  keepalive_start "$id"
+  pve pct exec "$id" -- env LC_ALL=C.UTF-8 bash -lc "$cmd" || rc=$?
+  keepalive_stop
+  return "$rc"
 }
 
+# Run on the box for interactive sessions: a tmux session that survives a dropped connection.
+# tmux is installed on demand in boxes built from an older golden image; without it, a plain shell.
+TMUX_ENSURE='command -v tmux >/dev/null 2>&1 || { echo "box: tmux missing in this box, installing..." >&2; DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tmux >/dev/null 2>&1 || true; }'
+
+# A terminal the box has no terminfo for (ghostty, kitty, ...) makes tmux refuse to start: fall back.
+TERM_FIX='infocmp "${TERM:-dumb}" >/dev/null 2>&1 || export TERM=xterm-256color'
+
+# box ssh [id|current] [--plain] [-- cmd...]
+# With no command on a terminal, attaches a persistent tmux session and, if the connection drops
+# (network change, LAN <-> Tailscale, sleep), reconnects by itself and reattaches to the same session.
 cmd_ssh() {
-  local id ip
-  id=$(resolve_id "${1:-current}"); shift || true
-  [ "${1:-}" = -- ] && shift
-  ip=$(rcall ip "$id")
-  exec ssh -J "$PVE_HOST" -i "$SSH_KEY" -o "UserKnownHostsFile=$(known_hosts "$id")" \
-    -o StrictHostKeyChecking=accept-new "root@$ip" "$@"
+  local id=current plain=0 ip irc rc tries=0 remote t0
+  if [ $# -gt 0 ] && [[ $1 =~ ^(current|[0-9]+)$ ]]; then id=$1; shift; fi
+  id=$(resolve_id "$id")
+  while [ $# -gt 0 ]; do
+    case "$1" in --plain) plain=1; shift;; --) shift; break;; *) break;; esac
+  done
+  if [ $# -gt 0 ] || [ "$plain" = 1 ] || ! [ -t 0 ] || ! [ -t 1 ]; then
+    ip=$(rcall ip "$id")
+    ct_ssh_opts "$id"
+    keepalive_start "$id"
+    rc=0; ssh "${CT_OPTS[@]}" "root@$ip" "$@" || rc=$?
+    keepalive_stop
+    return "$rc"
+  fi
+  remote="$TERM_FIX; $TMUX_ENSURE; if command -v tmux >/dev/null 2>&1; then exec tmux new-session -A -s ${BOX_SESSION:-box}; else echo 'box: tmux unavailable; plain shell, no reconnect persistence' >&2; exec bash -l; fi"
+  keepalive_start "$id"
+  while :; do
+    irc=0; ip=""
+    if route_try; then ip=$(rcall ip "$id") || irc=$?; else irc=255; fi
+    if [ "$irc" -eq 0 ]; then
+      ct_ssh_opts "$id"
+      t0=$SECONDS; rc=0; ssh -tt "${CT_OPTS[@]}" "root@$ip" "$remote" || rc=$?
+      [ "$rc" -eq 255 ] || { keepalive_stop; return "$rc"; }
+      # ssh also exits 255 when it never connected; only a session that lived a while earns a fresh budget
+      if [ $((SECONDS - t0)) -ge 15 ]; then tries=0; fi
+    elif [ "$irc" -ne 255 ]; then
+      keepalive_stop; exit "$irc"   # the host answered and refused (box stopped, not a box...): stop, no retry
+    fi
+    tries=$((tries+1))
+    if [ "$tries" -gt "$RECONNECT_TRIES" ]; then keepalive_stop; die "gave up reconnecting to box $id after $RECONNECT_TRIES attempts (the tmux session may still be alive: box ssh $id)"; fi
+    log "connection to box $id lost; reconnecting ($tries/$RECONNECT_TRIES)..."
+    sleep 2
+    PVE_ACTIVE=""
+  done
 }
 
 cmd_list() { rcall list; }
 
-# box doctor [--fix]: check that no box can end up in a backup job (--fix adds missing exclusions).
-cmd_doctor() {
-  local fix=0
-  case "${1:-}" in --fix) fix=1;; "") ;; *) die "doctor: unknown option $1";; esac
-  rcall doctor "$fix"
+# ---- box doctor ---------------------------------------------------------------------------------
+DOC_FAIL=0
+doc_line() {  # doc_line <ok|warn|FAIL|info> <message>
+  case "$1" in
+    ok) printf '  %sok%s    %s\n' "$C_OK" "$C_RST" "$2";;
+    warn) printf '  %swarn%s  %s\n' "$C_WARN" "$C_RST" "$2";;
+    FAIL) DOC_FAIL=1; printf '  %sFAIL%s  %s\n' "$C_ERR" "$C_RST" "$2";;
+    *) printf '  %s%s%s  %s\n' "$C_DIM" "$1" "$C_RST" "$2";;
+  esac
 }
+doc_render() { local st msg; while IFS=$'\t' read -r st msg; do [ -z "$st" ] || doc_line "$st" "$msg"; done; }
+
+# box doctor [--fix] [--e2e]
+#   routes: LAN / Tailscale reachability and that both addresses are the same host
+#   host:   required commands, storage, bridge, golden, cleanup timer, leases, tmux in boxes
+#   backup: no box can land in a backup job (--fix adds missing exclusions)
+#   --e2e:  create a throwaway box, ssh in, tmux session, lease, extend, destroy it
+cmd_doctor() {
+  local fix=0 e2e=0 a out rc lan=0 alt=0
+  for a in "$@"; do case "$a" in --fix) fix=1;; --e2e) e2e=1;; *) die "doctor: unknown option $a";; esac; done
+  [ -n "$PVE_HOST" ] || die "not configured; run: box init --host root@<pve-ip>"
+  printf '%sroute%s\n' "$C_B" "$C_RST"
+  if pve_probe "$PVE_HOST"; then lan=1; doc_line ok "LAN $PVE_HOST reachable"; else doc_line warn "LAN $PVE_HOST not reachable"; fi
+  if [ -n "$PVE_HOST_ALT" ]; then
+    if pve_probe "$PVE_HOST_ALT"; then
+      alt=1; doc_line ok "alternate $PVE_HOST_ALT reachable"
+      if same_host_key "$PVE_HOST" "$PVE_HOST_ALT"; then doc_line ok "both addresses present the same host key"
+      elif [ "$lan" = 1 ]; then doc_line FAIL "$PVE_HOST and $PVE_HOST_ALT present DIFFERENT host keys: they are not the same machine"
+      else doc_line info "cannot compare host keys while the LAN address is down"; fi
+    else
+      doc_line FAIL "alternate $PVE_HOST_ALT not reachable (Tailscale down, or the peer is offline: failover would not work right now)"
+    fi
+  else
+    doc_line warn "no alternate address: a lost LAN connection cannot recover. Fix: box init --force --host $PVE_HOST --alt root@<tailscale-ip>"
+  fi
+  PVE_ACTIVE=""; rm -f "$STATE_DIR/route"   # report what a fresh command would pick, not the 30s sticky fallback
+  if route_try; then doc_line ok "active route: $PVE_ACTIVE$([ "$PVE_ACTIVE" = "$PVE_HOST" ] && echo ' (LAN)' || echo ' (alternate)')"
+  else doc_line FAIL "no route to Proxmox"; exit 1; fi
+
+  printf '\n%shost%s\n' "$C_B" "$C_RST"
+  rc=0; out=$(rcall hostcheck) || rc=$?
+  [ "$rc" -eq 0 ] || doc_line FAIL "host checks failed to run (exit $rc)"
+  doc_render <<<"$out"
+
+  printf '\n%sbackups%s\n' "$C_B" "$C_RST"
+  rc=0; out=$(rcall doctor "$fix") || rc=$?
+  [ "$rc" -ne 255 ] || doc_line FAIL "backup checks failed to run"
+  doc_render <<<"$out"
+
+  if [ "$e2e" = 1 ]; then printf '\n%send to end%s\n' "$C_B" "$C_RST"; doctor_e2e; fi
+  if [ "$DOC_FAIL" = 0 ]; then printf '\n  %sall good%s\n' "$C_OK" "$C_RST"; else printf '\n  %sproblems found%s\n' "$C_ERR" "$C_RST"; exit 1; fi
+}
+
+doctor_e2e() {
+  local cur out id ip lease exp1 exp2 rc=0
+  cur=$(cat "$STATE_DIR/current" 2>/dev/null || true)
+  out=$(cmd_new --name "doctor-$RANDOM" --ttl 15m --disk 4 --owner doctor 2>/dev/null) || { doc_line FAIL "could not create a test box"; return; }
+  read -r id ip <<<"$out"
+  doc_line ok "created test box $id ($ip)"
+  # always remove the test box, whatever happens below
+  ct_ssh_opts "$id"
+  if ssh "${CT_OPTS[@]}" -o BatchMode=yes "root@$ip" true 2>/dev/null; then doc_line ok "ssh to the box through the active route"; else doc_line FAIL "ssh to the box failed"; fi
+  if pve pct exec "$id" -- bash -lc 'tmux new-session -d -s doctor "sleep 60" && tmux has-session -t doctor && tmux kill-session -t doctor' >/dev/null 2>&1; then
+    doc_line ok "tmux session starts inside the box"
+  else doc_line FAIL "tmux does not work in the box (rebuild the golden: box golden build --force)"; fi
+  lease=$(rcall lease "$id" 2>/dev/null || true)
+  if grep -q 'registered=yes' <<<"$lease" && grep -Eq 'ttl=[0-9]+' <<<"$lease"; then doc_line ok "lease and registry entry recorded"; else doc_line FAIL "lease/registry missing: $lease"; fi
+  exp1=$(sed -n 's/.*expires=\([0-9]*\).*/\1/p' <<<"$lease")
+  rcall extend "$id" 3600 >/dev/null 2>&1 || true
+  exp2=$(rcall lease "$id" 2>/dev/null | sed -n 's/.*expires=\([0-9]*\).*/\1/p')
+  if [ -n "$exp1" ] && [ -n "$exp2" ] && [ "$exp2" -gt "$exp1" ]; then doc_line ok "extend moves the expiry forward"; else doc_line FAIL "extend did not change the expiry ($exp1 -> $exp2)"; fi
+  rcall kill "$id" >/dev/null 2>&1 || rc=1
+  rm -f "$(known_hosts "$id")"
+  if rcall guard "$id" >/dev/null 2>&1; then doc_line FAIL "test box $id still exists after kill"; else doc_line ok "test box destroyed"; fi
+  if [ -n "$cur" ]; then printf '%s' "$cur" >"$STATE_DIR/current"; else rm -f "$STATE_DIR/current"; fi
+}
+
+# ---- leases, cleanup, jobs ------------------------------------------------------------------------
+# box extend [id|current] <duration>: keep a box alive at least that long from now (also adopts legacy boxes).
+cmd_extend() {
+  local id=current dur
+  if [ $# -ge 2 ]; then id=$1; shift; fi
+  dur=${1:?usage: box extend [id|current] <duration e.g. 2h>}
+  rcall extend "$(resolve_id "$id")" "$(ttl_seconds "$dur")"
+}
+
+# box adopt <id|all> [--ttl 1h]: give boxes that predate leases a lease and a registry entry, so
+# unattended cleanup may manage them. Their current expiry is kept.
+cmd_adopt() {
+  local id=${1:?usage: box adopt <id|all> [--ttl 1h]} ttl=$DEFAULT_TTL
+  shift
+  [ "${1:-}" != --ttl ] || ttl=${2:?--ttl needs a value}
+  [ "$id" = all ] || id=$(resolve_id "$id")
+  rcall adopt "$id" "$(ttl_seconds "$ttl")"
+}
+
+# box cleanup install|status|preview|run|mode
+cmd_cleanup() {
+  local sub=${1:-status} mode="" yes=0 a
+  shift || true
+  confirm_destroy() {
+    [ "$yes" = 1 ] && return 0
+    [ -t 0 ] && [ -c /dev/tty ] || die "mode destroy deletes expired boxes unattended; pass --yes to confirm"
+    printf '  destroy mode: the host will DELETE boxes %s after they expire (stopped first after %s). Type "destroy" to confirm: ' "$DESTROY_AFTER" "$GRACE"
+    IFS= read -r a </dev/tty; [ "$a" = destroy ] || die "aborted"
+  }
+  case "$sub" in
+    install)
+      while [ $# -gt 0 ]; do case "$1" in --mode) mode=$2; shift 2;; --yes) yes=1; shift;; *) die "cleanup install: unknown option $1";; esac; done
+      case "$mode" in ""|report|stop|destroy) ;; *) die "mode is report, stop or destroy";; esac
+      [ "$mode" != destroy ] || confirm_destroy
+      { echo '#!/usr/bin/env bash'; remote_env; printf '%s\n' "$REMOTE_LIB"; } | rcall_in install_host "$mode"
+      log "the host now runs 'box cleanup' every 5 minutes; check what it would do with: box cleanup preview" ;;
+    status) rcall cleanup_status ;;
+    preview) rcall cleanup report ;;
+    run) rcall cleanup ;;
+    mode)
+      mode=${1:?usage: box cleanup mode report|stop|destroy [--yes]}; shift
+      [ "${1:-}" != --yes ] || yes=1
+      [ "$mode" != destroy ] || confirm_destroy
+      rcall set_cleanup_mode "$mode" ;;
+    *) die "usage: box cleanup install [--mode report|stop|destroy] | status | preview | run | mode <m>" ;;
+  esac
+}
+
+# box job run|ls|log|stop: detached work inside a box (tmux), with log, exit status and an explicit lease.
+# The box's lease is extended to cover --lease (default 2h) and is NOT renewed by the job merely existing.
+cmd_job() {
+  local sub=${1:-ls} id=current lease=2h cmd="" jid follow=0
+  shift || true
+  if [ $# -gt 0 ] && [[ $1 =~ ^(current|[0-9]{1,6})$ ]]; then id=$1; shift; fi
+  id=$(resolve_id "$id")
+  case "$sub" in
+    run)
+      while [ $# -gt 0 ]; do case "$1" in --lease) lease=$2; shift 2;; --) shift; break;; *) break;; esac; done
+      [ $# -gt 0 ] || die "usage: box job run [id|current] [--lease 2h] -- <cmd...>"
+      if [ $# -eq 1 ]; then cmd=$1; else cmd=$(printf '%q ' "$@"); fi
+      rcall extend "$id" "$(ttl_seconds "$lease")" >&2
+      jid="$(date +%s)$RANDOM"
+      printf '%s\n' "$cmd" | pve pct exec "$id" -- bash -c "mkdir -p /var/log/box-jobs && cat > /var/log/box-jobs/$jid.sh"
+      pve pct exec "$id" -- env LC_ALL=C.UTF-8 bash -lc "$TMUX_ENSURE; command -v tmux >/dev/null || { echo 'box: no tmux in this box' >&2; exit 3; }; tmux new-session -d -s job-$jid 'bash -l /var/log/box-jobs/$jid.sh >/var/log/box-jobs/$jid.log 2>&1; echo \$? >/var/log/box-jobs/$jid.exit'" \
+        || die "could not start the job"
+      echo "$jid"
+      log "job $jid running in box $id; box job log $id $jid -f | box job ls $id | box job stop $id $jid" ;;
+    ls)
+      pve pct exec "$id" -- bash -c 'for f in /var/log/box-jobs/*.sh; do [ -e "$f" ] || continue; j=$(basename "$f" .sh); if tmux has-session -t "job-$j" 2>/dev/null; then st=running; elif [ -f "/var/log/box-jobs/$j.exit" ]; then st="exit $(cat /var/log/box-jobs/$j.exit)"; else st=lost; fi; printf "%s  %-9s %s\n" "$j" "$st" "$(head -1 "$f" | cut -c1-60)"; done' ;;
+    log)
+      jid=${1:?usage: box job log [id|current] <jobid> [-f]}; shift
+      [ "${1:-}" != -f ] || follow=1
+      [[ $jid =~ ^[0-9]+$ ]] || die "bad job id"
+      if [ "$follow" = 1 ]; then pve pct exec "$id" -- tail -n +1 -f "/var/log/box-jobs/$jid.log"; else pve pct exec "$id" -- cat "/var/log/box-jobs/$jid.log"; fi ;;
+    stop)
+      jid=${1:?usage: box job stop [id|current] <jobid>}
+      [[ $jid =~ ^[0-9]+$ ]] || die "bad job id"
+      pve pct exec "$id" -- tmux kill-session -t "job-$jid" ;;
+    *) die "usage: box job run|ls|log|stop" ;;
+  esac
+}
+
 cmd_stop() { rcall stop "$(resolve_id "${1:-current}")"; }
 
 cmd_resume() {
@@ -805,7 +1420,7 @@ remote_spec() {
 # box cp [-r] <src> <dest>: copy files to or from a box. rsync when both sides have it, else scp.
 # Trailing slash follows rsync: 'dir/' copies the contents, 'dir' copies the directory itself.
 cmd_cp() {
-  local recursive=0 a args=() src dst id ip rpath direction target kh e flags=()
+  local recursive=0 a o args=() src dst id ip rpath direction target e flags=()
   export LC_ALL=C   # ssh forwards LC_*; a box without your locale prints setlocale warnings otherwise
   for a in "$@"; do case "$a" in -r|-R) recursive=1;; *) args+=("$a");; esac; done
   [ "${#args[@]}" -eq 2 ] || die "usage: box cp [-r] <src> <dest>   (one side is <id|current>:<path>)"
@@ -821,11 +1436,11 @@ cmd_cp() {
   fi
   id=$(resolve_id "$R_ID"); rpath=$R_PATH
   ip=$(rcall ip "$id")
-  kh=$(known_hosts "$id")
+  ct_ssh_opts "$id"
   target="root@$ip:$rpath"
-  local ssh_opts=(-J "$PVE_HOST" -i "$SSH_KEY" -o "UserKnownHostsFile=$kh" -o StrictHostKeyChecking=accept-new -o BatchMode=yes)
+  local ssh_opts=("${CT_OPTS[@]}" -o BatchMode=yes)
   if command -v rsync >/dev/null && ssh "${ssh_opts[@]}" "root@$ip" 'command -v rsync >/dev/null' 2>/dev/null; then
-    e="ssh -J $PVE_HOST -i $SSH_KEY -o UserKnownHostsFile=$kh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+    e="ssh"; for o in "${ssh_opts[@]}"; do e+=" \"$o\""; done
     if [ "$direction" = push ]; then rsync -az --partial -e "$e" "$src" "$target"
     else rsync -az --partial -e "$e" "$target" "$dst"; fi
   else
@@ -853,7 +1468,7 @@ cmd_snap() {
   [[ $wait =~ ^[0-9]+$ ]] || die "snap: --wait is whole seconds"
   id=$(resolve_id "$id")
   [ -n "$out" ] || out=./box-snap-$id-$(date +%Y%m%d-%H%M%S).png
-  rcall guard "$id"
+  rcall touch "$id"
   pve pct exec "$id" -- env LC_ALL=C.UTF-8 bash -lc "B=\$(command -v chromium || command -v chromium-browser || command -v google-chrome) || { echo 'box: no chromium in this box (apt-get install -y chromium)' >&2; exit 3; }; rm -f /tmp/box-snap.png; timeout 120 \"\$B\" --headless=new --no-sandbox --disable-gpu --hide-scrollbars --window-size=${size/x/,} --virtual-time-budget=$((wait * 1000)) --screenshot=/tmp/box-snap.png '$url' >/dev/null 2>&1; test -s /tmp/box-snap.png" \
     || die "snap failed: chromium wrote no screenshot"
   tmp=$(mktemp)
@@ -894,7 +1509,17 @@ COMMANDS
                                 --tools "node@24 pnpm"  install runtimes with mise (node, pnpm, go, python...)
   box exec <id|current> -- <cmd...>   run command, print output (one arg = shell string)
                                 stdin passes through: printf %s "$TOKEN" | box exec current -- 'umask 077; cat > /root/.token'
-  box ssh  <id|current> [-- cmd]      interactive shell (or remote command) into the box
+  box ssh  <id|current> [--plain] [-- cmd]
+                                interactive shell = persistent tmux session. If the connection drops (network
+                                change, LAN <-> Tailscale, laptop sleep) it reconnects by itself and reattaches.
+                                --plain: ordinary ssh, no tmux, no reconnect. With a command: runs it, no tmux.
+  box job run [id] [--lease 2h] -- <cmd>   detached job in the box (tmux) -> prints a job id; the box lease is
+                                extended to cover --lease. box job ls|log <job> [-f]|stop <job> [id]
+  box extend [id] <dur>         keep a box alive at least <dur> from now (also adopts legacy boxes)
+  box adopt <id|all> [--ttl 1h] give boxes that predate leases a lease so unattended cleanup may manage them
+  box cleanup install [--mode report|stop|destroy] [--yes]
+                                install the host timer (every 5 min). Default and safe: report only.
+                                box cleanup status | preview | run | mode <m>
   box cp [-r] <src> <dest>      copy files; one side is <id|current>:<path>. rsync (else scp) over the
                                 PVE jump host. 'dir/' copies contents, 'dir' the directory itself
   box snap [id|current] <url> [out.png] [--size 1280x800] [--wait 5]
@@ -904,16 +1529,26 @@ COMMANDS
   box resume <id|current> [--ttl 1h]  start again + extend TTL -> prints "<id> <ip>"
   box kill <id|current> [-f]    DESTROY box and disk. Confirms on a TTY; -f required in scripts
   box shot <id|current> [out.png]     Xvfb :99 screenshot (starts display if needed)
-  box doctor [--fix]            check no box (or the golden) can land in a backup job; exit 1 on FAIL.
-                                --fix adds the missing exclusions
+  box doctor [--fix] [--e2e]    routes (LAN/Tailscale, same host key), host commands, golden, cleanup timer,
+                                leases, tmux, backup exclusions; exit 1 on FAIL. --fix adds missing backup
+                                exclusions. --e2e also creates, uses and destroys a throwaway box
   box gc [--expired]            stop expired boxes
   box gc --destroy [-f]         DESTROY expired boxes. Confirms on a TTY; -f required in scripts
   box help | -h                 this
 
 SEMANTICS
   <id>              numeric CT id (e.g. 9101). "current" = last box you created/resumed.
-  TTL               boxes expire after TTL (default 1h). Expired = stoppable/destroyable by
-                    gc; not auto-destroyed. resume --ttl extends. Stored as expires_<epoch>.
+  lease             boxes expire after TTL (default 1h) of inactivity: box exec/ssh/cp/snap/shot and
+                    an attached 'box ssh' renew it (never past MAX_LIFETIME, default 7d, since creation).
+                    resume --ttl / extend set it explicitly. Stored as expires_<epoch> in the CT notes.
+  cleanup           'box gc' is manual. 'box cleanup install' adds a host timer that works while every
+                    client is offline: expired + GRACE (10m) -> stop; +DESTROY_AFTER (24h) -> destroy.
+                    Starts REPORT-ONLY. It only touches boxes whose host registry entry and CT metadata
+                    agree (so boxes older than this feature need 'box adopt'), re-checks the lease under a
+                    per-box lock right before acting, and never destroys a box that has snapshots.
+  route             PVE_HOST is tried first; if it does not answer, PVE_HOST_ALT (Tailscale). Both share one
+                    pinned host key (~/.box/known_hosts_pve): a mismatch is refused. LAN wins again as
+                    soon as it answers. One-time setup: box init --alt root@<tailscale-ip> --force.
   safety            every command only touches ids 9101-9199 with PVE tag "box".
                     Anything else is refused. Truly destructive: kill, gc --destroy.
   guards            new/resume refuse when host RAM/swap is low, MAX_RUNNING boxes (default 6)
@@ -927,8 +1562,9 @@ SEMANTICS
                     Safe pattern: box new -> box exec current -- ... -> box kill current -f
 
 CONFIG & STATE
-  ~/.config/box/config   shell-sourced config (written by init): PVE_HOST SSH_KEY STORAGE
-                         BRIDGE TEMPLATE_VOLID GOLDEN_CTID ID_MIN ID_MAX defaults, guards, OWNER
+  ~/.config/box/config   shell-sourced config (written by init): PVE_HOST PVE_HOST_ALT SSH_KEY STORAGE
+                         BRIDGE TEMPLATE_VOLID GOLDEN_CTID ID_MIN ID_MAX defaults, guards, OWNER,
+                         CONNECT_TIMEOUT IDLE_RENEW MAX_LIFETIME GRACE DESTROY_AFTER RECONNECT_TRIES
   ~/.box/                local state: "current" file, per-box known_hosts, ssh control socket
   env overrides          BOX_CONFIG BOX_STATE BOX_FORCE=1
 USAGE
@@ -936,11 +1572,14 @@ USAGE
 
 main() {
   local c=${1:-help}; shift || true
+  case "$c" in init|help|-h|--help|doctor) ;; *) need_host ;; esac   # pick LAN or Tailscale once, up front
   case "$c" in
     init) cmd_init "$@";; golden) cmd_golden "$@";; new) cmd_new "$@";; exec) cmd_exec "$@";;
-    ssh) cmd_ssh "$@";; doctor) cmd_doctor "$@";; list|ls) cmd_list;; stop) cmd_stop "$@";; resume) cmd_resume "$@";;
+    ssh) cmd_ssh "$@";; doctor) cmd_doctor "$@";; extend) cmd_extend "$@";; adopt) cmd_adopt "$@";;
+    cleanup) cmd_cleanup "$@";; job) cmd_job "$@";; list|ls) cmd_list;; stop) cmd_stop "$@";; resume) cmd_resume "$@";;
     kill|rm) cmd_kill "$@";; shot) cmd_shot "$@";; snap) cmd_snap "$@";; cp) cmd_cp "$@";; gc) cmd_gc "$@";;
     help|-h|--help) usage;; *) usage >&2; exit 2;;
   esac
 }
-main "$@"
+# Sourceable for tests: only run when executed.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
