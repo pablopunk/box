@@ -174,9 +174,11 @@ r_new() {
   hn=${name:-box-$id}
   exp=$(( $(now) + ttl ))
 
-  pct clone "$GOLDEN_CTID" "$id" --hostname "$hn" "${clone_args[@]}" >&2
+  # Exclude the id from all-guest backup jobs before the CT exists, so no job can ever see it.
   NEW_ID=$id
   trap r_new_cleanup ERR
+  backup_exclude add "$id"
+  pct clone "$GOLDEN_CTID" "$id" --hostname "$hn" "${clone_args[@]}" >&2
   pct set "$id" --tags box --onboot 0 --swap 0 --cores "$cores" --memory "$mem" \
     --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp,firewall=0,type=veth" >&2
   set_desc "$id" "$owner" "$exp" "$hn"
@@ -184,7 +186,6 @@ r_new() {
   if [ -n "$cur" ] && [ "$disk" -gt "$cur" ]; then pct resize "$id" rootfs "${disk}G" >&2
   elif [ -n "$cur" ] && [ "$disk" -lt "$cur" ]; then log "note: golden rootfs is ${cur}G; cannot shrink to ${disk}G"; fi
   if [ "$gpu" = 1 ]; then pct set "$id" --dev0 /dev/dri/renderD128,mode=0666 >&2; fi
-  backup_exclude add "$id"
   pct start "$id" >&2
   exec 9>&-
   trap - ERR
@@ -286,6 +287,42 @@ r_check() {
   pvesh get /cluster/backup --output-format json | perl -MJSON::PP -e '
     local $/; my $j = JSON::PP::decode_json(<STDIN>);
     for my $x (@$j) { next unless $x->{all}; printf("  %s enabled=%s exclude=%s\n", $x->{id}, ($x->{enabled} // 1), ($x->{exclude} // "")); }'
+}
+
+# Verify that no box (and not the golden) can end up in a backup. One line per check:
+# "ok", "warn" or "FAIL". Exits 1 on FAIL. With fix=1, add every box id to the all-guest jobs first.
+# PVE ignores backup=0 on a container's rootfs (it is always backed up), so job exclusion is the guard.
+r_doctor() {
+  local fix=${1:-0} id mp out bad=0
+  if [ "$fix" = 1 ]; then
+    for id in "$GOLDEN_CTID" $(list_ids); do backup_exclude add "$id"; done
+  fi
+  out=$(pvesh get /cluster/backup --output-format json | perl -MJSON::PP -e '
+    local $/; my $jobs = JSON::PP::decode_json(<STDIN>);
+    my ($min, $max, $golden, @ids) = @ARGV; my %box = map { $_ => 1 } ($golden, @ids);
+    for my $j (@$jobs) {
+      next if defined $j->{enabled} && !$j->{enabled};
+      if ($j->{all}) {
+        my %ex = map { $_ => 1 } grep { length } split(/,/, ($j->{exclude} // ""));
+        my @missing = grep { !$ex{$_} } sort { $a <=> $b } keys %box;
+        print @missing ? "FAIL\tjob $j->{id} backs up all guests and does not exclude: @missing\n"
+                       : "ok\tjob $j->{id} backs up all guests and excludes every box\n";
+      } elsif (defined $j->{vmid} && length $j->{vmid}) {
+        my @hit = grep { $box{$_} || ($_ >= $min && $_ <= $max) } split(/,/, $j->{vmid});
+        print @hit ? "FAIL\tjob $j->{id} lists box ids: @hit\n" : "ok\tjob $j->{id} lists no box ids\n";
+      } elsif (defined $j->{pool} && length $j->{pool}) {
+        print "warn\tjob $j->{id} backs up pool $j->{pool}: keep box CTs out of that pool\n";
+      }
+    }' "$ID_MIN" "$ID_MAX" "$GOLDEN_CTID" $(list_ids)) || die "cannot read backup jobs"
+  [ -n "$out" ] || out="ok	no enabled backup jobs"
+  printf '%s\n' "$out"
+  for id in $(list_ids); do
+    mp=$(top_conf "$id" | grep -E '^mp[0-9]+:' | grep -v 'backup=0' || true)
+    if [ -n "$mp" ]; then echo "FAIL	CT $id has a volume mount point without backup=0: $mp"; bad=1; fi
+  done
+  echo "info	rootfs is always part of a container backup (PVE ignores backup=0 on it); the job exclusions above are the guard"
+  grep -q '^FAIL' <<<"$out" && bad=1
+  [ "$bad" = 0 ] || exit 1
 }
 
 r_guard_golden() {
@@ -713,6 +750,13 @@ cmd_ssh() {
 }
 
 cmd_list() { rcall list; }
+
+# box doctor [--fix]: check that no box can end up in a backup job (--fix adds missing exclusions).
+cmd_doctor() {
+  local fix=0
+  case "${1:-}" in --fix) fix=1;; "") ;; *) die "doctor: unknown option $1";; esac
+  rcall doctor "$fix"
+}
 cmd_stop() { rcall stop "$(resolve_id "${1:-current}")"; }
 
 cmd_resume() {
@@ -860,6 +904,8 @@ COMMANDS
   box resume <id|current> [--ttl 1h]  start again + extend TTL -> prints "<id> <ip>"
   box kill <id|current> [-f]    DESTROY box and disk. Confirms on a TTY; -f required in scripts
   box shot <id|current> [out.png]     Xvfb :99 screenshot (starts display if needed)
+  box doctor [--fix]            check no box (or the golden) can land in a backup job; exit 1 on FAIL.
+                                --fix adds the missing exclusions
   box gc [--expired]            stop expired boxes
   box gc --destroy [-f]         DESTROY expired boxes. Confirms on a TTY; -f required in scripts
   box help | -h                 this
@@ -873,7 +919,9 @@ SEMANTICS
   guards            new/resume refuse when host RAM/swap is low, MAX_RUNNING boxes (default 6)
                     are running, or storage >=85%. Raise MAX_RUNNING in the config; the RAM guard
                     is the real limit. Override only with explicit human OK: BOX_FORCE=1.
-  backups           box ids are auto-excluded from all-guest backup jobs.
+  backups           box ids are excluded from all-guest backup jobs before the CT exists. PVE always
+                    backs up a container's rootfs (backup=0 only works on extra mount points), so
+                    exclusion is the guard. 'box doctor' verifies it.
   output            new/resume print "<id> <ip>"; exec/ssh stream command output.
   scripts/agents    no prompts except init TUI; pass -f to kill/gc --destroy.
                     Safe pattern: box new -> box exec current -- ... -> box kill current -f
@@ -890,7 +938,7 @@ main() {
   local c=${1:-help}; shift || true
   case "$c" in
     init) cmd_init "$@";; golden) cmd_golden "$@";; new) cmd_new "$@";; exec) cmd_exec "$@";;
-    ssh) cmd_ssh "$@";; list|ls) cmd_list;; stop) cmd_stop "$@";; resume) cmd_resume "$@";;
+    ssh) cmd_ssh "$@";; doctor) cmd_doctor "$@";; list|ls) cmd_list;; stop) cmd_stop "$@";; resume) cmd_resume "$@";;
     kill|rm) cmd_kill "$@";; shot) cmd_shot "$@";; snap) cmd_snap "$@";; cp) cmd_cp "$@";; gc) cmd_gc "$@";;
     help|-h|--help) usage;; *) usage >&2; exit 2;;
   esac

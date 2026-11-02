@@ -49,5 +49,6 @@ box kill current -f                           # destroy when done (use-and-destr
 - Destructive commands (`kill`, `gc --destroy`) confirm on a TTY and require `-f` in scripts/agents.
 - `box` only touches ids in its configured range with PVE tag `box`; anything else is refused.
 - Resource guards refuse new boxes when host RAM/swap is tight, `MAX_RUNNING` is reached, or storage is full.
+- **Backups:** PVE always backs up a container's rootfs (`backup=0` only works on extra mount points), so box excludes every box id, and the golden, from all-guest backup jobs before the CT exists. `box doctor` verifies it (exit 1 on FAIL); `box doctor --fix` adds missing exclusions. Run it after changing backup jobs on the host.
 - Opt-in `--gpu` shares the host GPU via a DRM device bind — verify with a real encode, not just device listing.
 - Golden image ships mise (with node LTS), Docker, Chromium, xdg-utils, rsync and Xvfb/Openbox/xdotool/scrot. GUI apps need the Xvfb display (start it with `box shot`, then use `DISPLAY=:99`). Heavy toolchains install per box with `--tools`, not in the golden. Rebuild it with `box golden build --force` after changing the provisioning script.
