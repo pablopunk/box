@@ -28,7 +28,7 @@ default_key() {
 : "${DEFAULT_MEM:=1024}"
 : "${DEFAULT_DISK:=8}"
 : "${DEFAULT_TTL:=1h}"
-: "${MAX_RUNNING:=3}"
+: "${MAX_RUNNING:=6}"
 : "${MIN_FREE_MB:=1536}"
 : "${MIN_SWAP_FREE_MB:=1024}"
 : "${MAX_STORAGE_PCT:=85}"
@@ -333,9 +333,22 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl git openssh-server sudo procps iproute2 \
-  iputils-ping dnsutils netcat-openbsd file less zip unzip jq ripgrep build-essential pkg-config python3 python3-pip python3-venv nodejs npm golang-go
-apt-get install -y --no-install-recommends xvfb openbox xdotool scrot x11-utils x11-xserver-utils libnss3 libgbm1 xdg-utils chromium dbus-x11 \
+  iputils-ping dnsutils netcat-openbsd file less zip unzip jq ripgrep rsync locales build-essential pkg-config \
+  python3 python3-pip python3-venv
+apt-get install -y --no-install-recommends xvfb openbox xdotool scrot x11-utils x11-xserver-utils libnss3 libgbm1 \
+  xdg-utils dbus-x11 \
   || echo "WARN: GUI base failed"
+# Headless browser for 'box snap' and Playwright (use the system chromium via executablePath).
+apt-get install -y --no-install-recommends chromium fonts-liberation fonts-noto-color-emoji \
+  || echo "WARN: chromium failed"
+# A real UTF-8 locale, so forwarded LC_* variables do not print setlocale warnings.
+sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen && locale-gen >/dev/null || echo "WARN: locale-gen failed"
+# mise manages every language runtime (node, pnpm, go, python): 'box new --tools "node@24 pnpm"'.
+curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh || echo "WARN: mise install failed"
+cat >/etc/profile.d/mise.sh <<'MISE'
+export PATH="$HOME/.local/share/mise/shims:/usr/local/bin:$PATH"
+MISE
+if command -v mise >/dev/null; then mise use -g node@lts || echo "WARN: node via mise failed"; fi
 # GTK/ALSA package names differ across Debian releases (t64 suffix since trixie).
 apt-get install -y --no-install-recommends libgtk-3-0t64 libasound2t64 \
   || apt-get install -y --no-install-recommends libgtk-3-0 libasound2 \
@@ -638,21 +651,40 @@ cmd_golden() {
 }
 
 cmd_new() {
-  local cores=$DEFAULT_CORES mem=$DEFAULT_MEM disk=$DEFAULT_DISK ttl=$DEFAULT_TTL name="" gpu=0 owner=$OWNER out id ip
+  local cores=$DEFAULT_CORES mem=$DEFAULT_MEM disk=$DEFAULT_DISK ttl=$DEFAULT_TTL name="" gpu=0 owner=$OWNER tools="" out id ip
   while [ $# -gt 0 ]; do
     case "$1" in
       --cores) cores=$2; shift 2;; --mem) mem=$2; shift 2;; --disk) disk=${2%G}; shift 2;;
       --ttl) ttl=$2; shift 2;; --name) name=$2; shift 2;; --gpu) gpu=1; shift;; --owner) owner=$2; shift 2;;
+      --tools) tools=$2; shift 2;;
       *) die "new: unknown option $1";;
     esac
   done
   [[ $cores =~ ^[0-9]+$ && $mem =~ ^[0-9]+$ && $disk =~ ^[0-9]+$ ]] || die "cores/mem/disk must be integers (mem in MB, disk in G)"
   [ -z "$name" ] || [[ $name =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "name must be lowercase [a-z0-9-]"
   owner=$(printf '%s' "$owner" | tr -c 'A-Za-z0-9._-' '-')
+  [ -z "$tools" ] || [[ $tools =~ ^[A-Za-z0-9@._:/+\ -]+$ ]] || die "--tools: unexpected characters in '$tools'"
   out=$(rcall new "$name" "$cores" "$mem" "$disk" "$(ttl_seconds "$ttl")" "$owner" "$gpu")
   read -r id ip <<<"$out"
   printf '%s' "$id" >"$STATE_DIR/current"
+  [ -z "$tools" ] || install_tools "$id" "$tools"
   echo "$id $ip"
+}
+
+# Install runtimes with mise inside a box. Bootstraps mise when the golden image predates it.
+install_tools() {
+  local id=$1 tools=$2 script
+  script=$(cat <<'EOS'
+export LC_ALL=C.UTF-8
+set -e
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+command -v mise >/dev/null || { curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh; }
+printf 'export PATH="$HOME/.local/share/mise/shims:/usr/local/bin:$PATH"\n' >/etc/profile.d/mise.sh
+EOS
+)
+  script="$script"$'\n'"mise use -g --yes $tools"
+  log "installing '$tools' with mise in CT $id"
+  pve pct exec "$id" -- env LC_ALL=C.UTF-8 bash -lc "$script" >&2
 }
 
 cmd_exec() {
@@ -662,7 +694,7 @@ cmd_exec() {
   [ $# -gt 0 ] || die "usage: box exec <id|current> -- <cmd...>"
   rcall guard "$id"
   if [ $# -eq 1 ]; then cmd=$1; else cmd=$(printf '%q ' "$@"); fi
-  pve pct exec "$id" -- bash -lc "$cmd"
+  pve pct exec "$id" -- env LC_ALL=C.UTF-8 bash -lc "$cmd"
 }
 
 cmd_ssh() {
@@ -714,6 +746,72 @@ cmd_shot() {
   mv "$tmp" "$out"; echo "$out"
 }
 
+# remote_spec <arg>: succeeds when arg is <id|current>:<path>; sets R_ID and R_PATH.
+remote_spec() {
+  [[ ${1:-} =~ ^(current|[0-9]+):(.*)$ ]] || return 1
+  R_ID=${BASH_REMATCH[1]}; R_PATH=${BASH_REMATCH[2]}
+}
+
+# box cp [-r] <src> <dest>: copy files to or from a box. rsync when both sides have it, else scp.
+# Trailing slash follows rsync: 'dir/' copies the contents, 'dir' copies the directory itself.
+cmd_cp() {
+  local recursive=0 a args=() src dst id ip rpath direction target kh e flags=()
+  export LC_ALL=C   # ssh forwards LC_*; a box without your locale prints setlocale warnings otherwise
+  for a in "$@"; do case "$a" in -r|-R) recursive=1;; *) args+=("$a");; esac; done
+  [ "${#args[@]}" -eq 2 ] || die "usage: box cp [-r] <src> <dest>   (one side is <id|current>:<path>)"
+  src=${args[0]}; dst=${args[1]}
+  if remote_spec "$src"; then
+    ! remote_spec "$dst" || die "cp: copying between two boxes is not supported"
+    direction=pull
+    remote_spec "$src"
+  elif remote_spec "$dst"; then
+    direction=push
+  else
+    die "cp: one side must be <id|current>:<path>"
+  fi
+  id=$(resolve_id "$R_ID"); rpath=$R_PATH
+  ip=$(rcall ip "$id")
+  kh=$(known_hosts "$id")
+  target="root@$ip:$rpath"
+  local ssh_opts=(-J "$PVE_HOST" -i "$SSH_KEY" -o "UserKnownHostsFile=$kh" -o StrictHostKeyChecking=accept-new -o BatchMode=yes)
+  if command -v rsync >/dev/null && ssh "${ssh_opts[@]}" "root@$ip" 'command -v rsync >/dev/null' 2>/dev/null; then
+    e="ssh -J $PVE_HOST -i $SSH_KEY -o UserKnownHostsFile=$kh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+    if [ "$direction" = push ]; then rsync -az --partial -e "$e" "$src" "$target"
+    else rsync -az --partial -e "$e" "$target" "$dst"; fi
+  else
+    [ "$recursive" = 0 ] || flags=(-r)
+    if [ "$direction" = push ]; then scp ${flags[@]+"${flags[@]}"} "${ssh_opts[@]}" "$src" "$target"
+    else scp ${flags[@]+"${flags[@]}"} "${ssh_opts[@]}" "$target" "$dst"; fi
+  fi
+}
+
+# box snap [id|current] <url> [out.png] [--size WxH] [--wait SEC]: headless Chromium screenshot of a URL.
+# The browser runs in the box, so no window ever opens on your machine.
+cmd_snap() {
+  local id=current url out size=1280x800 wait=5 pos=() tmp
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --size) size=$2; shift 2;; --wait) wait=$2; shift 2;;
+      *) pos+=("$1"); shift;;
+    esac
+  done
+  if [ "${#pos[@]}" -gt 0 ] && [[ ${pos[0]} =~ ^(current|[0-9]+)$ ]]; then id=${pos[0]}; pos=(${pos[@]+"${pos[@]:1}"}); fi
+  [ "${#pos[@]}" -ge 1 ] || die "usage: box snap [id|current] <url> [out.png] [--size WxH] [--wait SEC]"
+  url=${pos[0]}; out=${pos[1]:-}
+  [[ $url =~ ^https?://[^[:space:]\'\"\\\`\$]+$ ]] || die "snap: url must be http(s), with no spaces or quotes"
+  [[ $size =~ ^[0-9]+x[0-9]+$ ]] || die "snap: --size looks like 1280x800"
+  [[ $wait =~ ^[0-9]+$ ]] || die "snap: --wait is whole seconds"
+  id=$(resolve_id "$id")
+  [ -n "$out" ] || out=./box-snap-$id-$(date +%Y%m%d-%H%M%S).png
+  rcall guard "$id"
+  pve pct exec "$id" -- env LC_ALL=C.UTF-8 bash -lc "B=\$(command -v chromium || command -v chromium-browser || command -v google-chrome) || { echo 'box: no chromium in this box (apt-get install -y chromium)' >&2; exit 3; }; rm -f /tmp/box-snap.png; timeout 120 \"\$B\" --headless=new --no-sandbox --disable-gpu --hide-scrollbars --window-size=${size/x/,} --virtual-time-budget=$((wait * 1000)) --screenshot=/tmp/box-snap.png '$url' >/dev/null 2>&1; test -s /tmp/box-snap.png" \
+    || die "snap failed: chromium wrote no screenshot"
+  tmp=$(mktemp)
+  pve pct exec "$id" -- cat /tmp/box-snap.png >"$tmp" || { rm -f "$tmp"; die "could not read the screenshot"; }
+  [ "$(head -c4 "$tmp" | tail -c3)" = PNG ] || { rm -f "$tmp"; die "result is not a PNG"; }
+  mv "$tmp" "$out"; echo "$out"
+}
+
 cmd_gc() {
   local mode=list force=0 a
   for a in "$@"; do
@@ -743,8 +841,14 @@ COMMANDS
   box golden build [--force]        build golden template CT (required once; --force rebuilds in place)
   box new [opts]                create + start a box -> prints "<id> <ip>"
                                 --cores N --mem MB --disk G --ttl 1h --name slug --gpu --owner X
+                                --tools "node@24 pnpm"  install runtimes with mise (node, pnpm, go, python...)
   box exec <id|current> -- <cmd...>   run command, print output (one arg = shell string)
+                                stdin passes through: printf %s "$TOKEN" | box exec current -- 'umask 077; cat > /root/.token'
   box ssh  <id|current> [-- cmd]      interactive shell (or remote command) into the box
+  box cp [-r] <src> <dest>      copy files; one side is <id|current>:<path>. rsync (else scp) over the
+                                PVE jump host. 'dir/' copies contents, 'dir' the directory itself
+  box snap [id|current] <url> [out.png] [--size 1280x800] [--wait 5]
+                                headless Chromium screenshot of a URL, run inside the box
   box list                      table of boxes: id, name, status, ip, ttl left, cores, mem, owner
   box stop <id|current>         stop (disk kept, TTL kept)
   box resume <id|current> [--ttl 1h]  start again + extend TTL -> prints "<id> <ip>"
@@ -760,8 +864,9 @@ SEMANTICS
                     gc; not auto-destroyed. resume --ttl extends. Stored as expires_<epoch>.
   safety            every command only touches ids 9101-9199 with PVE tag "box".
                     Anything else is refused. Truly destructive: kill, gc --destroy.
-  guards            new/resume refuse when host RAM/swap is low, >3 boxes running, or
-                    storage >=85%. Override only with explicit human OK: BOX_FORCE=1.
+  guards            new/resume refuse when host RAM/swap is low, MAX_RUNNING boxes (default 6)
+                    are running, or storage >=85%. Raise MAX_RUNNING in the config; the RAM guard
+                    is the real limit. Override only with explicit human OK: BOX_FORCE=1.
   backups           box ids are auto-excluded from all-guest backup jobs.
   output            new/resume print "<id> <ip>"; exec/ssh stream command output.
   scripts/agents    no prompts except init TUI; pass -f to kill/gc --destroy.
@@ -780,7 +885,7 @@ main() {
   case "$c" in
     init) cmd_init "$@";; golden) cmd_golden "$@";; new) cmd_new "$@";; exec) cmd_exec "$@";;
     ssh) cmd_ssh "$@";; list|ls) cmd_list;; stop) cmd_stop "$@";; resume) cmd_resume "$@";;
-    kill|rm) cmd_kill "$@";; shot) cmd_shot "$@";; gc) cmd_gc "$@";;
+    kill|rm) cmd_kill "$@";; shot) cmd_shot "$@";; snap) cmd_snap "$@";; cp) cmd_cp "$@";; gc) cmd_gc "$@";;
     help|-h|--help) usage;; *) usage >&2; exit 2;;
   esac
 }

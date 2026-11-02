@@ -9,13 +9,17 @@ That's the whole install. It clones this repo to `~/.local/share/box`, links `bo
 ## Example
 
 ```sh
-box new --mem 2048 --ttl 2h --name scratch    # -> 9101 192.168.1.57
-box exec current -- 'uname -a && docker --version'
+box new --mem 2048 --ttl 2h --name scratch --tools "node@24 pnpm"   # -> 9101 192.168.1.57
+box exec current -- 'uname -a && node -v'
+box cp ./site/ current:/root/site/             # rsync (scp fallback) over the PVE jump host
+box snap https://example.com ./shot.png        # headless Chromium screenshot, run in the box
+box shot current ./display.png                 # Xvfb :99 screenshot
 box ssh current
-box shot current ./shot.png                   # Xvfb :99 screenshot
 box stop current; box resume current --ttl 1h
 box kill current --yes
-box gc                                        # dry run; --expired stops, --destroy --yes deletes
+box gc                                         # dry run; --expired stops, --destroy --yes deletes
 ```
 
-The golden template includes Chromium, `xdg-open`, and an Xvfb display for GUI tasks, plus common networking and archive utilities. Start the display with `box shot`, then run GUI commands with `DISPLAY=:99`. Existing golden templates need `box golden build --force` to pick up package changes; Proxmox may refuse a rebuild while boxes still reference the template.
+The golden template includes mise, Chromium, `xdg-open`, rsync, and an Xvfb display for GUI tasks, plus common networking and archive utilities. Start the display with `box shot`, then run GUI commands with `DISPLAY=:99`. Existing golden templates need `box golden build --force` to pick up package changes; Proxmox may refuse a rebuild while boxes still reference the template.
+
+`MAX_RUNNING` (default 6) and the other limits live in `~/.config/box/config`.
